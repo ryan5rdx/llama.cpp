@@ -253,7 +253,11 @@ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
         return false;
     }
-    return sock->send_data(msg, msg_size);
+    if (!sock->send_data(msg, msg_size)) {
+        return false;
+    }
+    sock->flush();
+    return true;
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
@@ -308,6 +312,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->send_data(input, input_size)) {
         return false;
     }
+    sock->flush();
     return true;
 }
 
@@ -1782,6 +1787,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
+void ggml_backend_rpc_set_rdma_device(const char * name) {
+    rpc_transport_set_rdma_device(name);
+}
+
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
@@ -1977,6 +1986,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_set_rdma_device") == 0) {
+        return (void *)ggml_backend_rpc_set_rdma_device;
     }
     return NULL;
 

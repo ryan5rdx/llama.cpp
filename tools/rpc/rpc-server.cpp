@@ -175,6 +175,7 @@ struct rpc_server_params {
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
+    std::string              rdma_device;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
@@ -186,6 +187,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "      --rdma-dev NAME              pin the local RDMA device (e.g. rdma_en6); overrides GGML_RDMA_DEV\n");
     fprintf(stderr, "\n");
 }
 
@@ -233,6 +235,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--rdma-dev") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.rdma_device = argv[i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -335,6 +342,15 @@ int main(int argc, char * argv[]) {
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
+    }
+
+    if (!params.rdma_device.empty()) {
+        auto set_rdma_dev_fn = (decltype(ggml_backend_rpc_set_rdma_device)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_set_rdma_device");
+        if (set_rdma_dev_fn) {
+            set_rdma_dev_fn(params.rdma_device.c_str());
+        } else {
+            fprintf(stderr, "warning: RPC backend has no RDMA support; --rdma-dev ignored\n");
+        }
     }
 
     start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());

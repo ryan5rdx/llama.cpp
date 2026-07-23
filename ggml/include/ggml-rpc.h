@@ -27,6 +27,10 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
 
+// Pin the local RDMA device by name (e.g. "rdma_en6"), overriding auto-detection
+// and GGML_RDMA_DEV. Needed when a host has several RDMA links. No-op without RDMA.
+GGML_BACKEND_API void ggml_backend_rpc_set_rdma_device(const char * name);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 

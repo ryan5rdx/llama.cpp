@@ -15,6 +15,7 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    void flush();
 
     socket_ptr accept();
 
@@ -32,3 +33,8 @@ private:
 
 bool rpc_transport_init();
 void rpc_transport_shutdown();
+
+// Pin the local RDMA device by name (e.g. "rdma_en6"), overriding auto-detection
+// and the GGML_RDMA_DEV env var. A host with several RDMA links must select the
+// one facing the peer. NULL/empty clears the override. No-op without RDMA.
+void rpc_transport_set_rdma_device(const char * name);
