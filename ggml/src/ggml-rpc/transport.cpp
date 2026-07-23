@@ -1060,12 +1060,25 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 #  else
     bool activated = rdma_activate(rc.qpn, rc.psn, rc.gid);
 #  endif
-    if (activated) {
-        use_rdma = true;
-    } else {
+    if (!activated) {
         GGML_LOG_ERROR("RDMA activate failed, staying on TCP\n");
         rdma.reset();
+        return;
     }
+#  ifdef GGML_RPC_RDMA_APPLE
+    // Readiness barrier over TCP (use_rdma is still false here, so send/recv use
+    // TCP): both peers have posted recvs and reached RTS before either sends its
+    // first UC frame. Apple UC silently drops a SEND with no matching posted recv
+    // and has no retransmit, so without this the first frame races the peer's
+    // RTR/post-recv (works only when the receiver happens to win the race).
+    uint8_t sync = 0x2A;
+    if (!send_data(&sync, sizeof(sync)) || !recv_data(&sync, sizeof(sync))) {
+        GGML_LOG_ERROR("RDMA readiness barrier failed, staying on TCP\n");
+        rdma.reset();
+        return;
+    }
+#  endif
+    use_rdma = true;
 #else
     (void)remote_caps;
 #endif // GGML_RPC_RDMA
