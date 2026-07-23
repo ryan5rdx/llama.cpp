@@ -732,16 +732,8 @@ bool socket_t::impl::rdma_probe() {
     rdma->recv_mr = ibv_reg_mr(rdma->pd, rdma->recv_mem, ring_bytes, mr_flags);
     if (!rdma->send_mr || !rdma->recv_mr) return false;
 
-    // Self-tune: post recvs until the provider refuses (Apple caps outstanding
-    // recv frames per port). Identical peers converge to the same depth, keeping
-    // credit accounting symmetric without exchanging it.
-    int posted = 0;
-    for (int i = 0; i < RDMA_NBUF; i++) {
-        if (!rdma->post_recv(i)) { if (posted < 2) return false; break; }
-        posted++;
-    }
-    rdma->nbuf = posted;
-    rdma->send_credits = posted;
+    // Recvs are posted after RTS (in rdma_activate), not here: Apple's provider
+    // only accepts them once the QP is ready to receive.
 
     rdma_local = {};
     rdma_local.qpn = rdma->qp->qp_num;
@@ -751,8 +743,8 @@ bool socket_t::impl::rdma_probe() {
     rdma_local.gid_idx = gid_idx;
     rdma_local.path_mtu = pa.active_mtu;
 
-    GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d rx_depth=%d\n",
-                  matched, port, gid_idx, rdma_local.qpn, (unsigned)pa.lid, 128 << rdma->path_mtu, posted);
+    GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d\n",
+                  matched, port, gid_idx, rdma_local.qpn, (unsigned)pa.lid, 128 << rdma->path_mtu);
     return true;
 }
 
@@ -789,6 +781,20 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint16_t remote_lid, con
             return false;
         }
     }
+
+    // Self-tune the recv ring now that the QP is in RTS: post recvs until the
+    // provider refuses (Apple caps outstanding recv frames per port). Identical
+    // peers converge to the same depth, keeping credit accounting symmetric
+    // without exchanging it. send_credits = our posted recvs = what the peer,
+    // which posted the same count, may send us.
+    int posted = 0;
+    for (int i = 0; i < RDMA_NBUF; i++) {
+        if (!c->post_recv(i)) { if (posted < 2) { GGML_LOG_ERROR("RDMA(Apple/UC) post_recv failed (only %d)\n", posted); return false; } break; }
+        posted++;
+    }
+    c->nbuf = posted;
+    c->send_credits = posted;
+
     GGML_LOG_INFO("RDMA(Apple/UC) activated: qpn=%u->%u mtu=%d rx_depth=%d\n",
                   rdma_local.qpn, remote_qpn, 128 << c->path_mtu, c->nbuf);
     return true;
