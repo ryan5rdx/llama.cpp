@@ -16,6 +16,7 @@ struct socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
     void flush();
+    bool is_rdma() const;
 
     socket_ptr accept();
 

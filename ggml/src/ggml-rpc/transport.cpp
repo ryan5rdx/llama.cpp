@@ -1098,6 +1098,10 @@ void socket_t::flush() {
     pimpl->flush();
 }
 
+bool socket_t::is_rdma() const {
+    return pimpl->use_rdma;
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
