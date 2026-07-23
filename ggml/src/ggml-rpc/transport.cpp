@@ -158,7 +158,8 @@ struct rdma_conn {
     struct ibv_mr * recv_mr  = nullptr;
 
     int      nbuf = 0;                 // effective ring depth (self-tuned)
-    int      send_busy[RDMA_NBUF] = {};
+    int      send_busy[RDMA_NBUF] = {};  // posted send WQEs, per buffer (reaped -> 0)
+    int      rx_outstanding = 0;         // posted recv WQEs not yet completed
     struct { int buf; uint32_t off; uint32_t len; } inq[RDMA_NBUF] = {};
     int      inq_head = 0;
     int      inq_count = 0;
@@ -181,7 +182,9 @@ struct rdma_conn {
         wr.wr_id   = RDMA_RECV_WR | (uint64_t)i;
         wr.sg_list = &sge;
         wr.num_sge = 1;
-        return ibv_post_recv(qp, &wr, &bad) == 0;
+        bool ok = ibv_post_recv(qp, &wr, &bad) == 0;
+        if (ok) rx_outstanding++;
+        return ok;
     }
 
     bool post_send(int i, size_t len) {
@@ -198,32 +201,44 @@ struct rdma_conn {
         return ibv_post_send(qp, &wr, &bad) == 0;
     }
 
-    // Quiesce before deregistering MRs: forcing the QP to ERR flushes every
-    // outstanding SEND/RECV WQE; reap them all (success or IBV_WC_WR_FLUSH_ERR) so
-    // the NHI is not mid-transfer on an MR when we dereg (else a DART PTE fault).
+    // Quiesce before deregistering MRs. Apple's UC provider tears down an MR's DART
+    // mapping immediately on dereg without draining the NHI ring, so an MR may be
+    // deregistered only after every WQE that names it -- SEND and RECV -- has
+    // completed; otherwise the DMA engine faults an invalidated PTE and panics the
+    // ring. Forcing the QP to ERR flushes all outstanding WQEs to completions; reap
+    // them (success or IBV_WC_WR_FLUSH_ERR) until BOTH directions are provably zero
+    // (no send buffer still busy, and rx_outstanding == 0) -- explicit counters, not
+    // a CQ-idle heuristic. Bounded so a wedged provider cannot spin forever.
     void drain_for_teardown() {
         struct ibv_wc wc[RDMA_NBUF * 2];
-        int empty = 0;
         for (int spin = 0; spin < 1000000; spin++) {
-            int busy = 0;
-            for (int k = 0; k < nbuf; k++) if (send_busy[k]) { busy = 1; break; }
-            int n = ibv_poll_cq(cq, RDMA_NBUF * 2, wc);
-            if (n < 0) return;
-            for (int j = 0; j < n; j++) {
-                if ((wc[j].wr_id & RDMA_RECV_WR) == 0) send_busy[(int)(wc[j].wr_id & 0xffff)] = 0;
+            int tx_busy = 0;
+            for (int k = 0; k < nbuf; k++) if (send_busy[k]) { tx_busy = 1; break; }
+            if (!tx_busy && rx_outstanding <= 0) {
+                return;   // every SEND and RECV WQE has been reaped
             }
-            if (n == 0) { if (!busy && ++empty >= 2) return; }
-            else empty = 0;
+            int n = ibv_poll_cq(cq, RDMA_NBUF * 2, wc);
+            if (n < 0) return;   // poll failed: nothing more we can do
+            for (int j = 0; j < n; j++) {
+                if ((wc[j].wr_id & RDMA_RECV_WR) != 0) {
+                    if (rx_outstanding > 0) rx_outstanding--;
+                } else {
+                    send_busy[(int)(wc[j].wr_id & 0xffff)] = 0;
+                }
+            }
         }
+        GGML_LOG_ERROR("RDMA(Apple/UC) teardown drain did not fully quiesce (WQEs may still reference the MR)\n");
     }
 
     ~rdma_conn() {
+        broken = true;   // stop any further posting before we drain and dereg
         if (qp) {
             struct ibv_qp_attr a = {};
             a.qp_state = IBV_QPS_ERR;
             ibv_modify_qp(qp, &a, IBV_QP_STATE);
             drain_for_teardown();
         }
+        // drain, then dereg: no WQE may still name an MR when it is deregistered.
         if (send_mr) ibv_dereg_mr(send_mr);
         if (recv_mr) ibv_dereg_mr(recv_mr);
         free(send_mem);
@@ -817,6 +832,7 @@ int socket_t::impl::rdma_progress() {
         }
         if (is_recv) {
             int b = (int)(id & 0xffff);
+            if (c->rx_outstanding > 0) c->rx_outstanding--;   // this recv WQE is done
             const rdma_seg_hdr * h = (const rdma_seg_hdr *)(c->recv_mem + (size_t)b * RDMA_STRIDE);
             if (h->magic != RDMA_SEG_MAGIC) { GGML_LOG_ERROR("RDMA(Apple/UC) bad segment magic\n"); c->broken = true; return -1; }
             c->send_credits += (int)h->credit;
