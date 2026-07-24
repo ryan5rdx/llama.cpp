@@ -17,6 +17,10 @@ struct socket_t {
     bool recv_data(void * data, size_t size);
     void flush();
     bool is_rdma() const;
+    // Pin the local RDMA device for THIS connection (overrides auto-selection).
+    // A client with several RDMA links uses this to face the right peer per worker.
+    // Must be set before the caps handshake. No-op without RDMA.
+    void set_rdma_device(const char * name);
 
     socket_ptr accept();
 

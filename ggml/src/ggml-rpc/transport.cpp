@@ -283,9 +283,13 @@ struct socket_t::impl {
     bool rdma_probe();
     bool rdma_send(const void * data, size_t size);
     bool rdma_recv(void * data, size_t size);
+    // GID-shaped target from this connection's local TCP address (getsockname);
+    // used to auto-select the local device facing the peer on a multi-link host.
+    std::optional<rdma_gid_t> rdma_build_target_gid();
 
     std::unique_ptr<rdma_conn> rdma;
     rdma_local_info            rdma_local = {};
+    std::string                conn_rdma_device;   // per-connection device override (highest priority)
 #  ifdef GGML_RPC_RDMA_APPLE
     bool rdma_activate(uint32_t remote_qpn, uint16_t remote_lid, const uint8_t * remote_gid);
     int  rdma_progress();
@@ -295,7 +299,6 @@ struct socket_t::impl {
     void rdma_flush();
 #  else
     bool tcp_peer_closed();
-    std::optional<rdma_gid_t> rdma_build_target_gid();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
     bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc);
 #  endif
@@ -318,26 +321,11 @@ socket_t::impl::~impl() {
 
 #ifdef GGML_RPC_RDMA
 
-#ifndef GGML_RPC_RDMA_APPLE
-
-bool socket_t::impl::tcp_peer_closed() {
-    if (fd < 0) return false;
-#ifndef _WIN32
-    struct pollfd pfd = { fd, POLLIN | POLLRDHUP, 0 };
-    int r = poll(&pfd, 1, 0);
-    return r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP));
-#else
-    return false;
-#endif
-}
-
-// Build a RoCE GID-shaped 16-byte target from a TCP socket's local address.
-// Used to match the socket's local IP against the kernel's GID table so that
-// a single memcmp handles IPv4, IPv4-mapped IPv6, and native IPv6 uniformly:
-//   AF_INET                -> ::ffff:a.b.c.d  (bytes 10-11 = 0xff, last 4 = IPv4)
-//   AF_INET6 (IPv4-mapped) -> ::ffff:a.b.c.d  (already in GID shape)
-//   AF_INET6 (native v6)   -> the 16-byte IPv6 address as-is
-// Returns std::nullopt on unsupported family or getsockname failure.
+// Build a RoCE GID-shaped 16-byte target from this connection's local TCP
+// address (getsockname). On a host with several RDMA links the local address of
+// the socket to a given peer identifies the interface facing that peer, so the
+// device whose GID equals this target is the one cabled to the peer. Handles
+// IPv4, IPv4-mapped IPv6, and native IPv6 uniformly via a single memcmp.
 std::optional<rdma_gid_t> socket_t::impl::rdma_build_target_gid() {
     sockaddr_storage addr = {};
     socklen_t addr_len = sizeof(addr);
@@ -358,6 +346,19 @@ std::optional<rdma_gid_t> socket_t::impl::rdma_build_target_gid() {
         return target;
     }
     return std::nullopt;
+}
+
+#ifndef GGML_RPC_RDMA_APPLE
+
+bool socket_t::impl::tcp_peer_closed() {
+    if (fd < 0) return false;
+#ifndef _WIN32
+    struct pollfd pfd = { fd, POLLIN | POLLRDHUP, 0 };
+    int r = poll(&pfd, 1, 0);
+    return r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP));
+#else
+    return false;
+#endif
 }
 
 bool socket_t::impl::rdma_probe() {
@@ -667,22 +668,30 @@ static uint8_t rdma_first_active_port(struct ibv_context * ctx, struct ibv_port_
     return 0;
 }
 
-// Phase 1: open a device with an ACTIVE port and usable GID (pinned by
-// --rdma-dev / GGML_RDMA_DEV, else first usable), create a UC QP, register the
-// STRIDE rings, self-tune the recv depth, and capture the local endpoint.
+// Phase 1: pick the local device facing this peer, create a UC QP, register the
+// STRIDE rings, and capture the local endpoint. Selection priority:
+//   1. explicit name (per-connection map / --rdma-dev / GGML_RDMA_DEV);
+//   2. else the device whose GID matches this connection's local TCP address
+//      (auto per-peer selection on a multi-link host - RDMA is point-to-point,
+//      so the wrong local device makes RTR fail with no path);
+//   3. else the first device with an active port and usable GID.
 bool socket_t::impl::rdma_probe() {
-    const char * dev = !g_rdma_device.empty() ? g_rdma_device.c_str() : std::getenv("GGML_RDMA_DEV");
+    const char * dev = !conn_rdma_device.empty() ? conn_rdma_device.c_str()
+                     : !g_rdma_device.empty()    ? g_rdma_device.c_str()
+                     :                             std::getenv("GGML_RDMA_DEV");
+    const std::optional<rdma_gid_t> target = rdma_build_target_gid();
 
     int ndev = 0;
     ibv_device ** devs = ibv_get_device_list(&ndev);
     if (!devs || ndev <= 0) { if (devs) ibv_free_device_list(devs); return false; }
 
-    ibv_context * ctx = nullptr;
+    ibv_context * ctx = nullptr;    // currently-chosen device (kept open)
     uint8_t port = 0;
     struct ibv_port_attr pa = {};
     union ibv_gid gid = {};
     int gid_idx = -1;
     const char * matched = "";
+    bool gid_matched = false;       // chosen device's GID matches the peer-facing local address
     for (int d = 0; d < ndev; d++) {
         const char * name = ibv_get_device_name(devs[d]);
         if (dev && dev[0] && (!name || strcmp(name, dev) != 0)) continue;
@@ -694,11 +703,25 @@ bool socket_t::impl::rdma_probe() {
         union ibv_gid g = {};
         int gi = rdma_select_gid(c, pt, p.gid_tbl_len, &g);
         if (gi < 0) { ibv_close_device(c); continue; }
-        ctx = c; port = pt; pa = p; gid = g; gid_idx = gi; matched = name ? name : "";
-        break;
+
+        const bool this_match = target.has_value() &&
+            memcmp(g.raw, target->data(), RDMA_GID_SIZE) == 0;
+        if (!ctx) {                         // first usable candidate (fallback)
+            ctx = c; port = pt; pa = p; gid = g; gid_idx = gi; matched = name ? name : ""; gid_matched = this_match;
+        } else if (this_match && !gid_matched) {   // peer-facing device: replace fallback
+            ibv_close_device(ctx);
+            ctx = c; port = pt; pa = p; gid = g; gid_idx = gi; matched = name ? name : ""; gid_matched = true;
+        } else {
+            ibv_close_device(c);
+        }
+        if (gid_matched) break;             // the device facing the peer wins outright
     }
     ibv_free_device_list(devs);
     if (!ctx) return false;
+    if (target.has_value() && !gid_matched && (!dev || !dev[0])) {
+        GGML_LOG_INFO("RDMA(Apple/UC) no device GID matched the local address; using first active (%s). "
+                      "On a multi-link host set --rdma-dev / GGML_RDMA_DEV to the device facing this peer.\n", matched);
+    }
 
     rdma = std::make_unique<rdma_conn>();
     rdma->ctx = ctx;
@@ -758,8 +781,9 @@ bool socket_t::impl::rdma_probe() {
     rdma_local.gid_idx = gid_idx;
     rdma_local.path_mtu = pa.active_mtu;
 
-    GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d\n",
-                  matched, port, gid_idx, rdma_local.qpn, (unsigned)pa.lid, 128 << rdma->path_mtu);
+    GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d select=%s\n",
+                  matched, port, gid_idx, rdma_local.qpn, (unsigned)pa.lid, 128 << rdma->path_mtu,
+                  (dev && dev[0]) ? "pinned" : (gid_matched ? "gid-match" : "first-active"));
     return true;
 }
 
@@ -1113,6 +1137,14 @@ void socket_t::flush() {
 
 bool socket_t::is_rdma() const {
     return pimpl->use_rdma;
+}
+
+void socket_t::set_rdma_device(const char * name) {
+#ifdef GGML_RPC_RDMA
+    pimpl->conn_rdma_device = (name && name[0]) ? name : "";
+#else
+    (void)name;
+#endif
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {

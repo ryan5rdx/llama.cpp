@@ -359,6 +359,36 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     return true;
 }
 
+// Optional per-endpoint RDMA device pin: GGML_RDMA_DEV_MAP="host1=dev1,host2=dev2"
+// keyed by the --rpc host. A client with several RDMA links uses this to face the
+// right worker per endpoint when GID auto-matching cannot disambiguate (e.g. all
+// links share one bridged subnet). Returns "" if unset or no match.
+static std::string rdma_device_for_host(const std::string & host) {
+    const char * env = std::getenv("GGML_RDMA_DEV_MAP");
+    if (!env || !env[0]) {
+        return "";
+    }
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t");
+        size_t b = s.find_last_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string s(env);
+    for (size_t i = 0; i < s.size(); ) {
+        size_t comma = s.find(',', i);
+        std::string entry = s.substr(i, comma == std::string::npos ? std::string::npos : comma - i);
+        size_t eq = entry.find('=');
+        if (eq != std::string::npos && trim(entry.substr(0, eq)) == host) {
+            return trim(entry.substr(eq + 1));
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        i = comma + 1;
+    }
+    return "";
+}
+
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -389,6 +419,10 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     auto sock = socket_t::connect(host.c_str(), port);
     if (sock == nullptr) {
         return nullptr;
+    }
+    std::string rdma_dev = rdma_device_for_host(host);
+    if (!rdma_dev.empty()) {
+        sock->set_rdma_device(rdma_dev.c_str());
     }
     if (!negotiate_hello(sock)) {
         return nullptr;
