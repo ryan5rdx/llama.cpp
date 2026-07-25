@@ -28,6 +28,7 @@
 #  include <array>
 #  include <cerrno>
 #  include <time.h>
+#  include <sched.h>
 #  ifndef _WIN32
 #    include <poll.h>
 #  endif
@@ -970,7 +971,7 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
                         return false;
                     }
                 }
-                if (idle > 64u) { struct timespec ts = { 0, 10000 }; nanosleep(&ts, nullptr); }
+                if (idle > 64u) { sched_yield(); }
             } else {
                 idle = 0;
             }
@@ -1007,16 +1008,7 @@ void socket_t::impl::rdma_flush() {
 bool socket_t::impl::send_data(const void * data, size_t size) {
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
-        if (!rdma_send(data, size)) {
-            return false;
-        }
-#ifdef GGML_RPC_RDMA_APPLE
-        // Flush immediately so small writes are posted without waiting
-        // for an explicit flush() call. No-op when the frame is already full
-        // or pend_buf is -1 (already posted).
-        rdma_post_pending();
-#endif
-        return true;
+        return rdma_send(data, size);
     }
 #endif
     size_t bytes_sent = 0;
