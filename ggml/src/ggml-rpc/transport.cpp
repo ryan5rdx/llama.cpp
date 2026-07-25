@@ -134,7 +134,7 @@ static constexpr uint32_t RDMA_SEG_MAGIC  = 0x52534547u; // "RSEG"
 static constexpr uint32_t RDMA_SEG_DATA   = 1;
 static constexpr uint32_t RDMA_SEG_CREDIT = 2;
 static constexpr int      RDMA_NBUF       = 16;          // ring depth; self-tuned down if the provider caps it
-static constexpr size_t   RDMA_STRIDE     = 128 * 1024;  // 32 x 4 KiB frames; every SEND transfers a full STRIDE
+static constexpr size_t   RDMA_STRIDE     = 64 * 1024;   // 16 x 4 KiB TB frames; every SEND transfers a full STRIDE
 static constexpr uint32_t RDMA_PSN        = 0;
 static constexpr uint64_t RDMA_RECV_WR    = 1ull << 20;  // tags recv completions in wr_id
 
@@ -970,7 +970,7 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
                         return false;
                     }
                 }
-                if (idle > 64u) { struct timespec ts = { 0, 60000 }; nanosleep(&ts, nullptr); }
+                if (idle > 64u) { struct timespec ts = { 0, 10000 }; nanosleep(&ts, nullptr); }
             } else {
                 idle = 0;
             }
@@ -1007,7 +1007,16 @@ void socket_t::impl::rdma_flush() {
 bool socket_t::impl::send_data(const void * data, size_t size) {
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
-        return rdma_send(data, size);
+        if (!rdma_send(data, size)) {
+            return false;
+        }
+#ifdef GGML_RPC_RDMA_APPLE
+        // Flush immediately so small writes are posted without waiting
+        // for an explicit flush() call. No-op when the frame is already full
+        // or pend_buf is -1 (already posted).
+        rdma_post_pending();
+#endif
+        return true;
     }
 #endif
     size_t bytes_sent = 0;
