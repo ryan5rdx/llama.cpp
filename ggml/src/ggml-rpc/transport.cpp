@@ -135,7 +135,7 @@ static constexpr uint32_t RDMA_SEG_MAGIC  = 0x52534547u; // "RSEG"
 static constexpr uint32_t RDMA_SEG_DATA   = 1;
 static constexpr uint32_t RDMA_SEG_CREDIT = 2;
 static constexpr int      RDMA_NBUF       = 16;          // ring depth; self-tuned down if the provider caps it
-static constexpr size_t   RDMA_STRIDE     = 64 * 1024;   // 16 x 4 KiB TB frames; every SEND transfers a full STRIDE
+static constexpr size_t   RDMA_STRIDE     = 128 * 1024;  // 32 x 4 KiB TB frames; every SEND transfers a full STRIDE
 static constexpr uint32_t RDMA_PSN        = 0;
 static constexpr uint64_t RDMA_RECV_WR    = 1ull << 20;  // tags recv completions in wr_id
 
