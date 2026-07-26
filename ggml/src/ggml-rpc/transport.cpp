@@ -202,44 +202,17 @@ struct rdma_conn {
         return ibv_post_send(qp, &wr, &bad) == 0;
     }
 
-    // Quiesce before deregistering MRs. Apple's UC provider tears down an MR's DART
-    // mapping immediately on dereg without draining the NHI ring, so an MR may be
-    // deregistered only after every WQE that names it -- SEND and RECV -- has
-    // completed; otherwise the DMA engine faults an invalidated PTE and panics the
-    // ring. Forcing the QP to ERR flushes all outstanding WQEs to completions; reap
-    // them (success or IBV_WC_WR_FLUSH_ERR) until BOTH directions are provably zero
-    // (no send buffer still busy, and rx_outstanding == 0) -- explicit counters, not
-    // a CQ-idle heuristic. Bounded so a wedged provider cannot spin forever.
-    void drain_for_teardown() {
-        struct ibv_wc wc[RDMA_NBUF * 2];
-        for (int spin = 0; spin < 1000000; spin++) {
-            int tx_busy = 0;
-            for (int k = 0; k < nbuf; k++) if (send_busy[k]) { tx_busy = 1; break; }
-            if (!tx_busy && rx_outstanding <= 0) {
-                return;   // every SEND and RECV WQE has been reaped
-            }
-            int n = ibv_poll_cq(cq, RDMA_NBUF * 2, wc);
-            if (n < 0) return;   // poll failed: nothing more we can do
-            for (int j = 0; j < n; j++) {
-                if ((wc[j].wr_id & RDMA_RECV_WR) != 0) {
-                    if (rx_outstanding > 0) rx_outstanding--;
-                } else {
-                    send_busy[(int)(wc[j].wr_id & 0xffff)] = 0;
-                }
-            }
-        }
-        GGML_LOG_ERROR("RDMA(Apple/UC) teardown drain did not fully quiesce (WQEs may still reference the MR)\n");
-    }
-
     ~rdma_conn() {
-        broken = true;   // stop any further posting before we drain and dereg
+        broken = true;
         if (qp) {
             struct ibv_qp_attr a = {};
             a.qp_state = IBV_QPS_ERR;
             ibv_modify_qp(qp, &a, IBV_QP_STATE);
-            drain_for_teardown();
+            // drain CQ once so all WQEs flushed by ERR are reaped before
+            // we dereg MRs and destroy the QP
+            struct ibv_wc wc[RDMA_NBUF * 2];
+            while (ibv_poll_cq(cq, RDMA_NBUF * 2, wc) > 0) {}
         }
-        // drain, then dereg: no WQE may still name an MR when it is deregistered.
         if (send_mr) ibv_dereg_mr(send_mr);
         if (recv_mr) ibv_dereg_mr(recv_mr);
         free(send_mem);
