@@ -1053,7 +1053,7 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
     memset(local_caps, 0, RPC_CONN_CAPS_SIZE);
 #ifdef GGML_RPC_RDMA
     rdma_local = {};
-    if (rdma_probe()) {
+    if (!std::getenv("GGML_RPC_NO_RDMA") && rdma_probe()) {
         rdma_caps rc = {};
         rc.qpn = rdma_local.qpn;
 #  ifdef GGML_RPC_RDMA_APPLE
