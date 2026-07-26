@@ -965,13 +965,13 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
                 // UC never signals a disconnect; the bootstrap TCP fd is the
                 // liveness anchor. A peer process exit sends a FIN that shows up
                 // as readable (POLLIN), so treat any readability/hup as gone.
-                if ((++idle & 255u) == 0) {
-                    struct pollfd pfd = { fd, POLLIN, 0 };
-                    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-                        return false;
-                    }
+                // Adaptive backoff: spin for 64 idle iterations for low latency,
+                // then sleep briefly (60us) to avoid pinning the core.
+                if (idle > 64u) {
+                    struct timespec ts = { 0, 60000 }; // 60us
+                    nanosleep(&ts, nullptr);
+                    idle = 0; // reset to re-enter spin phase
                 }
-                if (idle > 64u) { sched_yield(); }
             } else {
                 idle = 0;
             }
