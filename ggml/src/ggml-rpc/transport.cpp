@@ -128,22 +128,20 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 #ifdef GGML_RPC_RDMA_APPLE
 // Apple RDMA-over-Thunderbolt: UC QP, two-sided IBV_WR_SEND only, no RDMA-CM.
 // A UC SEND with no matching posted recv is silently dropped, and send size must
-// equal recv size, so this is a credit-flow-controlled, fixed-STRIDE, coalescing
-// byte stream. Endpoints (GID/QPN/LID) are exchanged out of band via the TCP caps
-// handshake; PSN is a fixed constant (UC does not use it for retransmit).
-static constexpr uint32_t RDMA_SEG_MAGIC  = 0x52534547u; // "RSEG"
-static constexpr uint32_t RDMA_SEG_DATA   = 1;
-static constexpr uint32_t RDMA_SEG_CREDIT = 2;
-static constexpr int      RDMA_NBUF       = 16;          // ring depth; self-tuned down if the provider caps it
-static constexpr size_t   RDMA_STRIDE     = 128 * 1024;  // 32 x 4 KiB TB frames; every SEND transfers a full STRIDE
-static constexpr uint32_t RDMA_PSN        = 0;
-static constexpr uint64_t RDMA_RECV_WR    = 1ull << 20;  // tags recv completions in wr_id
+// equal recv size, so this is a fixed-STRIDE coalescing byte stream. Endpoints
+// (GID/QPN/LID) are exchanged out of band via the TCP caps handshake; PSN is a
+// fixed constant (UC does not use it for retransmit). Hardware credit-based
+// flow control ensures a SEND is not processed until the peer has posted a
+// matching RECV, so no application-level credit protocol is needed.
+static constexpr uint32_t RDMA_SEG_MAGIC = 0x52534547u; // "RSEG"
+static constexpr int      RDMA_NBUF      = 16;          // ring depth; self-tuned down if the provider caps it
+static constexpr size_t   RDMA_STRIDE    = 128 * 1024;  // 32 x 4 KiB TB frames; every SEND transfers a full STRIDE
+static constexpr uint32_t RDMA_PSN       = 0;
+static constexpr uint64_t RDMA_RECV_WR   = 1ull << 20;  // tags recv completions in wr_id
 
 struct rdma_seg_hdr {
-    uint32_t magic;
-    uint32_t type;   // RDMA_SEG_DATA or RDMA_SEG_CREDIT
-    uint32_t len;    // valid payload bytes (0 for CREDIT)
-    uint32_t credit; // recv-buffer credits granted to the peer
+    uint32_t magic; // RDMA_SEG_MAGIC
+    uint32_t len;   // valid payload bytes (0 = padding)
 };
 static constexpr size_t RDMA_PAYLOAD = RDMA_STRIDE - sizeof(rdma_seg_hdr);
 
@@ -164,12 +162,9 @@ struct rdma_conn {
     struct { int buf; uint32_t off; uint32_t len; } inq[RDMA_NBUF] = {};
     int      inq_head = 0;
     int      inq_count = 0;
-    int      send_credits = 0;         // DATA segments we may still send (peer recv slots)
-    int      grant_pending = 0;        // recvs we have freed and owe the peer as credits
     int      pend_buf = -1;            // send buffer accumulating coalesced writes, or -1
     uint32_t pend_len = 0;
     bool     broken = false;
-
     uint8_t      port = 0;
     int          gid_idx = 0;
     enum ibv_mtu path_mtu = IBV_MTU_1024;
@@ -267,7 +262,6 @@ struct socket_t::impl {
 #  ifdef GGML_RPC_RDMA_APPLE
     bool rdma_activate(uint32_t remote_qpn, uint16_t remote_lid, const uint8_t * remote_gid);
     int  rdma_progress();
-    void rdma_flush_credits();
     bool rdma_acquire_pending();
     bool rdma_post_pending();
     void rdma_flush();
@@ -795,26 +789,23 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint16_t remote_lid, con
         }
     }
 
-    // Self-tune the recv ring now that the QP is in RTS: post recvs until the
-    // provider refuses (Apple caps outstanding recv frames per port). Identical
-    // peers converge to the same depth, keeping credit accounting symmetric
-    // without exchanging it. send_credits = our posted recvs = what the peer,
-    // which posted the same count, may send us.
+    // Self-tune the recv ring: post recvs until the provider refuses
+    // (Apple caps outstanding recv frames per port). Both peers converge to
+    // the same depth since they run identical code.
     int posted = 0;
     for (int i = 0; i < RDMA_NBUF; i++) {
         if (!c->post_recv(i)) { if (posted < 2) { GGML_LOG_ERROR("RDMA(Apple/UC) post_recv failed (only %d)\n", posted); return false; } break; }
         posted++;
     }
     c->nbuf = posted;
-    c->send_credits = posted;
 
     GGML_LOG_INFO("RDMA(Apple/UC) activated: qpn=%u->%u mtu=%d rx_depth=%d\n",
                   rdma_local.qpn, remote_qpn, 128 << c->path_mtu, c->nbuf);
     return true;
 }
 
-// Drain the CQ once: free completed sends, queue recv DATA segments (re-post
-// deferred to recv), handle CREDIT segments inline. Returns count, or -1.
+// Drain the CQ once: free completed sends, enqueue completed recv DATA segments.
+// Returns count, or -1 on error.
 int socket_t::impl::rdma_progress() {
     rdma_conn * c = rdma.get();
     struct ibv_wc wc[RDMA_NBUF * 2];
@@ -830,44 +821,19 @@ int socket_t::impl::rdma_progress() {
         }
         if (is_recv) {
             int b = (int)(id & 0xffff);
-            if (c->rx_outstanding > 0) c->rx_outstanding--;   // this recv WQE is done
+            if (c->rx_outstanding > 0) c->rx_outstanding--;
             const rdma_seg_hdr * h = (const rdma_seg_hdr *)(c->recv_mem + (size_t)b * RDMA_STRIDE);
             if (h->magic != RDMA_SEG_MAGIC) { GGML_LOG_ERROR("RDMA(Apple/UC) bad segment magic\n"); c->broken = true; return -1; }
-            c->send_credits += (int)h->credit;
-            if (h->type == RDMA_SEG_DATA) {
-                int slot = (c->inq_head + c->inq_count) % c->nbuf;
-                c->inq[slot].buf = b;
-                c->inq[slot].off = 0;
-                c->inq[slot].len = h->len;
-                c->inq_count++;
-            } else {
-                if (!c->post_recv(b)) { c->broken = true; return -1; }
-                c->grant_pending++;
-            }
+            int slot = (c->inq_head + c->inq_count) % c->nbuf;
+            c->inq[slot].buf  = b;
+            c->inq[slot].off  = 0;
+            c->inq[slot].len  = h->len;
+            c->inq_count++;
         } else {
             c->send_busy[(int)(id & 0xffff)] = 0;
         }
     }
     return n;
-}
-
-// Return freed recvs to the peer as a standalone CREDIT segment once enough have
-// piled up with no data going back (keeps a one-directional burst from stalling).
-void socket_t::impl::rdma_flush_credits() {
-    rdma_conn * c = rdma.get();
-    if (c->grant_pending < c->nbuf / 2 || c->send_credits <= 0) return;
-    int i = -1;
-    for (int k = 0; k < c->nbuf; k++) if (!c->send_busy[k] && k != c->pend_buf) { i = k; break; }
-    if (i < 0) return;
-    rdma_seg_hdr * h = (rdma_seg_hdr *)(c->send_mem + (size_t)i * RDMA_STRIDE);
-    h->magic = RDMA_SEG_MAGIC;
-    h->type  = RDMA_SEG_CREDIT;
-    h->len   = 0;
-    h->credit = (uint32_t)c->grant_pending;
-    c->grant_pending = 0;
-    if (!c->post_send(i, RDMA_STRIDE)) { c->broken = true; return; }
-    c->send_busy[i] = 1;
-    c->send_credits--;
 }
 
 // Reserve a free send buffer to coalesce into, waiting on progress if none free.
@@ -885,20 +851,12 @@ bool socket_t::impl::rdma_acquire_pending() {
 bool socket_t::impl::rdma_post_pending() {
     rdma_conn * c = rdma.get();
     if (c->pend_buf < 0) return true;
-    while (c->send_credits <= 0) {
-        if (c->broken) return false;
-        if (rdma_progress() < 0) return false;
-    }
     int i = c->pend_buf;
     rdma_seg_hdr * h = (rdma_seg_hdr *)(c->send_mem + (size_t)i * RDMA_STRIDE);
     h->magic = RDMA_SEG_MAGIC;
-    h->type  = RDMA_SEG_DATA;
     h->len   = c->pend_len;
-    h->credit = (uint32_t)c->grant_pending;
-    c->grant_pending = 0;
     if (!c->post_send(i, RDMA_STRIDE)) { c->broken = true; return false; }
     c->send_busy[i] = 1;
-    c->send_credits--;
     c->pend_buf = -1;
     c->pend_len = 0;
     return true;
@@ -961,10 +919,8 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
         c->inq[slot].off += take;
         if (c->inq[slot].off == c->inq[slot].len) {
             if (!c->post_recv(b)) { c->broken = true; return false; }
-            c->grant_pending++;
             c->inq_head = (c->inq_head + 1) % c->nbuf;
             c->inq_count--;
-            rdma_flush_credits();
         }
     }
     return true;
