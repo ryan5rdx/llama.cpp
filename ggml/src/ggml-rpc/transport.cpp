@@ -893,16 +893,15 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
             if (n == 0) {
                 // UC never signals a disconnect; the bootstrap TCP fd is the
                 // liveness anchor. A peer process exit sends a FIN that shows up
-                // as readable (POLLIN) on macOS. Poll every 256 idle iterations
-                // (non-blocking); sched_yield after 64 to avoid pinning the core.
-                if ((++idle & 255u) == 0) {
+                // as readable (POLLIN) on macOS. Match Linux rdma_poll: check
+                // every ~1M idle iterations (0x100000).
+                if ((++idle & 0xFFFFF) == 0 && idle > 1) {
                     struct pollfd pfd = { fd, POLLIN, 0 };
                     if (poll(&pfd, 1, 0) > 0 &&
                         (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
                         return false;
                     }
                 }
-                if (idle > 64u) { sched_yield(); }
             } else {
                 idle = 0;
             }
