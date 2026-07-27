@@ -29,7 +29,6 @@
 #  include <array>
 #  include <cerrno>
 #  include <time.h>
-#  include <sched.h>
 #endif // GGML_RPC_RDMA
 
 #ifdef _WIN32
@@ -46,7 +45,8 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 // Local RDMA device pinned via rpc_transport_set_rdma_device() (e.g. from the
 // worker's --rdma-dev). Overrides the GGML_RDMA_DEV env var; empty = auto-select.
-static std::string g_rdma_device;
+static std::mutex  g_rdma_device_mu;
+static std::string g_rdma_device;   // guarded by g_rdma_device_mu
 
 #ifdef GGML_RPC_RDMA
 static constexpr size_t RDMA_GID_SIZE = 16;            // RoCE GID / IB GID is always 16 bytes
@@ -125,17 +125,21 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 
 #ifdef GGML_RPC_RDMA_APPLE
 // Apple RDMA-over-Thunderbolt: UC QP, two-sided IBV_WR_SEND only, no RDMA-CM.
-// A UC SEND with no matching posted recv is silently dropped, and send size must
-// equal recv size, so this is a fixed-STRIDE coalescing byte stream. Endpoints
+// Per Apple TN3205 a SEND and its matching RECV must span the same number of
+// Thunderbolt frames, so this is a fixed-STRIDE coalescing byte stream. Endpoints
 // (GID/QPN/LID) are exchanged out of band via the TCP caps handshake; PSN is a
-// fixed constant (UC does not use it for retransmit). Hardware credit-based
-// flow control ensures a SEND is not processed until the peer has posted a
-// matching RECV, so no application-level credit protocol is needed.
-static constexpr uint32_t RDMA_SEG_MAGIC = 0x52534547u; // "RSEG"
-static constexpr int      RDMA_NBUF      = 16;          // ring depth; self-tuned down if the provider caps it
-static constexpr size_t   RDMA_STRIDE    = 128 * 1024;  // 32 x 4 KiB TB frames; every SEND transfers a full STRIDE
-static constexpr uint32_t RDMA_PSN       = 0;
-static constexpr uint64_t RDMA_RECV_WR   = 1ull << 20;  // tags recv completions in wr_id
+// fixed constant (UC does not use it for retransmit). A UC SEND with no matching
+// posted recv is silently dropped, so the readiness handshake in update_caps
+// ensures both peers have posted recvs before the first frame; thereafter the
+// Thunderbolt link layer's credit-based flow control (TN3205) provides
+// backpressure, so no application-level credit protocol is needed.
+static constexpr uint32_t RDMA_SEG_MAGIC   = 0x52534547u; // "RSEG"
+static constexpr int      RDMA_NBUF        = 16;          // ring depth; self-tuned down if the provider caps it
+static constexpr size_t   RDMA_STRIDE      = 128 * 1024;  // 32 x 4 KiB TB frames; every SEND transfers a full STRIDE
+static constexpr uint32_t RDMA_PSN         = 0;
+static constexpr uint64_t RDMA_RECV_WR     = 1ull << 20;  // wr_id bit tagging recv completions
+static constexpr uint64_t RDMA_WR_IDX_MASK = 0xffff;      // buffer index in the low bits of wr_id
+static constexpr uint8_t  RDMA_SYNC_READY  = 0x2A;        // readiness-handshake byte (peer activated)
 
 struct rdma_seg_hdr {
     uint32_t magic; // RDMA_SEG_MAGIC
@@ -156,7 +160,6 @@ struct rdma_conn {
 
     int      nbuf = 0;                 // effective ring depth (self-tuned)
     int      send_busy[RDMA_NBUF] = {};  // posted send WQEs, per buffer (reaped -> 0)
-    int      rx_outstanding = 0;         // posted recv WQEs not yet completed
     struct { int buf; uint32_t off; uint32_t len; } inq[RDMA_NBUF] = {};
     int      inq_head = 0;
     int      inq_count = 0;
@@ -176,9 +179,7 @@ struct rdma_conn {
         wr.wr_id   = RDMA_RECV_WR | (uint64_t)i;
         wr.sg_list = &sge;
         wr.num_sge = 1;
-        bool ok = ibv_post_recv(qp, &wr, &bad) == 0;
-        if (ok) rx_outstanding++;
-        return ok;
+        return ibv_post_recv(qp, &wr, &bad) == 0;
     }
 
     bool post_send(int i, size_t len) {
@@ -221,9 +222,6 @@ struct rdma_local_info {
     uint32_t qpn = 0;
     uint16_t lid = 0;
     uint8_t  gid[RDMA_GID_SIZE] = {};
-    uint8_t  ib_port = 0;
-    int      gid_idx = 0;
-    enum ibv_mtu path_mtu = IBV_MTU_1024;
 };
 
 struct rdma_caps {
@@ -242,7 +240,8 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
-    void flush();
+    bool flush();
+    bool is_broken() const;
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
@@ -262,7 +261,7 @@ struct socket_t::impl {
     int  rdma_progress();
     bool rdma_acquire_pending();
     bool rdma_post_pending();
-    void rdma_flush();
+    bool rdma_flush();
 #  else
     bool tcp_peer_closed();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
@@ -598,7 +597,7 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 #ifdef GGML_RPC_RDMA_APPLE
 
 static bool rdma_gid_is_zero(const union ibv_gid * g) {
-    for (int i = 0; i < 16; i++) if (g->raw[i]) return false;
+    for (size_t i = 0; i < RDMA_GID_SIZE; i++) if (g->raw[i]) return false;
     return true;
 }
 
@@ -642,8 +641,13 @@ static uint8_t rdma_first_active_port(struct ibv_context * ctx, struct ibv_port_
 //      so the wrong local device makes RTR fail with no path);
 //   3. else the first device with an active port and usable GID.
 bool socket_t::impl::rdma_probe() {
+    std::string global_dev;
+    {
+        std::lock_guard<std::mutex> lock(g_rdma_device_mu);
+        global_dev = g_rdma_device;
+    }
     const char * dev = !conn_rdma_device.empty() ? conn_rdma_device.c_str()
-                     : !g_rdma_device.empty()    ? g_rdma_device.c_str()
+                     : !global_dev.empty()       ? global_dev.c_str()
                      :                             std::getenv("GGML_RDMA_DEV");
     const std::optional<rdma_gid_t> target = rdma_build_target_gid();
 
@@ -743,9 +747,6 @@ bool socket_t::impl::rdma_probe() {
     rdma_local.qpn = rdma->qp->qp_num;
     rdma_local.lid = pa.lid;
     memcpy(rdma_local.gid, gid.raw, RDMA_GID_SIZE);
-    rdma_local.ib_port = port;
-    rdma_local.gid_idx = gid_idx;
-    rdma_local.path_mtu = pa.active_mtu;
 
     GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d select=%s\n",
                   matched, port, gid_idx, rdma_local.qpn, (unsigned)pa.lid, 128 << rdma->path_mtu,
@@ -818,17 +819,17 @@ int socket_t::impl::rdma_progress() {
             return -1;
         }
         if (is_recv) {
-            int b = (int)(id & 0xffff);
-            if (c->rx_outstanding > 0) c->rx_outstanding--;
+            int b = (int)(id & RDMA_WR_IDX_MASK);
             const rdma_seg_hdr * h = (const rdma_seg_hdr *)(c->recv_mem + (size_t)b * RDMA_STRIDE);
             if (h->magic != RDMA_SEG_MAGIC) { GGML_LOG_ERROR("RDMA(Apple/UC) bad segment magic\n"); c->broken = true; return -1; }
+            if (h->len > RDMA_PAYLOAD) { GGML_LOG_ERROR("RDMA(Apple/UC) segment len %u exceeds payload\n", h->len); c->broken = true; return -1; }
             int slot = (c->inq_head + c->inq_count) % c->nbuf;
             c->inq[slot].buf  = b;
             c->inq[slot].off  = 0;
             c->inq[slot].len  = h->len;
             c->inq_count++;
         } else {
-            c->send_busy[(int)(id & 0xffff)] = 0;
+            c->send_busy[(int)(id & RDMA_WR_IDX_MASK)] = 0;
         }
     }
     return n;
@@ -925,8 +926,8 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
     return true;
 }
 
-void socket_t::impl::rdma_flush() {
-    if (rdma) rdma_post_pending();
+bool socket_t::impl::rdma_flush() {
+    return rdma ? rdma_post_pending() : true;
 }
 
 #endif // GGML_RPC_RDMA_APPLE
@@ -1010,38 +1011,52 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
     }
 #  ifdef GGML_RPC_RDMA_APPLE
     bool activated = rdma_activate(rc.qpn, rc.lid, rc.gid);
+    // Mutual readiness handshake over TCP (use_rdma is still false here, so this
+    // runs on TCP). Both peers advertised RDMA, so each sends a 1-byte status and
+    // RDMA is enabled only if BOTH sides activated: a UC SEND with no matching
+    // posted recv is silently dropped (TN3205) and rdma_activate can fail on one
+    // side only, so this prevents a one-sided upgrade and guarantees both peers
+    // have posted recvs before the first UC frame.
+    uint8_t local_ready = activated ? RDMA_SYNC_READY : 0;
+    uint8_t peer_ready  = 0;
+    if (!send_data(&local_ready, sizeof(local_ready)) ||
+        !recv_data(&peer_ready, sizeof(peer_ready))) {
+        rdma.reset();
+        return;
+    }
+    if (activated && peer_ready == RDMA_SYNC_READY) {
+        use_rdma = true;
+    } else {
+        GGML_LOG_ERROR("RDMA activation not mutual, staying on TCP\n");
+        rdma.reset();
+    }
 #  else
-    bool activated = rdma_activate(rc.qpn, rc.psn, rc.gid);
-#  endif
-    if (!activated) {
+    if (rdma_activate(rc.qpn, rc.psn, rc.gid)) {
+        use_rdma = true;
+    } else {
         GGML_LOG_ERROR("RDMA activate failed, staying on TCP\n");
         rdma.reset();
-        return;
-    }
-#  ifdef GGML_RPC_RDMA_APPLE
-    // Readiness barrier over TCP (use_rdma is still false here, so send/recv use
-    // TCP): both peers have posted recvs and reached RTS before either sends its
-    // first UC frame. Apple UC silently drops a SEND with no matching posted recv
-    // and has no retransmit, so without this the first frame races the peer's
-    // RTR/post-recv (works only when the receiver happens to win the race).
-    uint8_t sync = 0x2A;
-    if (!send_data(&sync, sizeof(sync)) || !recv_data(&sync, sizeof(sync))) {
-        GGML_LOG_ERROR("RDMA readiness barrier failed, staying on TCP\n");
-        rdma.reset();
-        return;
     }
 #  endif
-    use_rdma = true;
 #else
     (void)remote_caps;
 #endif // GGML_RPC_RDMA
 }
 
-void socket_t::impl::flush() {
+bool socket_t::impl::flush() {
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
-        rdma_flush();
+        return rdma_flush();
     }
+#endif
+    return true;
+}
+
+bool socket_t::impl::is_broken() const {
+#ifdef GGML_RPC_RDMA_APPLE
+    return use_rdma && rdma && rdma->broken;
+#else
+    return false;
 #endif
 }
 
@@ -1060,12 +1075,16 @@ bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
 }
 
-void socket_t::flush() {
-    pimpl->flush();
+bool socket_t::flush() {
+    return pimpl->flush();
 }
 
 bool socket_t::is_rdma() const {
     return pimpl->use_rdma;
+}
+
+bool socket_t::is_broken() const {
+    return pimpl->is_broken();
 }
 
 void socket_t::set_rdma_device(const char * name) {
@@ -1169,6 +1188,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
 }
 
 void rpc_transport_set_rdma_device(const char * name) {
+    std::lock_guard<std::mutex> lock(g_rdma_device_mu);
     g_rdma_device = (name && name[0]) ? name : "";
 }
 

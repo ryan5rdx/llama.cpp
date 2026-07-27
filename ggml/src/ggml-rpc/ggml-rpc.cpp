@@ -256,8 +256,7 @@ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
     if (!sock->send_data(msg, msg_size)) {
         return false;
     }
-    sock->flush();
-    return true;
+    return sock->flush();
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
@@ -312,8 +311,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->send_data(input, input_size)) {
         return false;
     }
-    sock->flush();
-    return true;
+    return sock->flush();
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -393,17 +391,21 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    // RDMA connections are pinned for the process lifetime: on Apple's UC provider
-    // a QP cannot be re-created cheaply (single-use QPs, per-port QP/recv-frame
-    // caps, costly teardown), so letting the weak_ptr expire between the startup
-    // queries and model load would churn a fresh connection each time and wedge
-    // the device. TCP keeps its weak_ptr lifetime (reconnect is cheap there).
+    // Apple UC QPs are single-use and expensive to recreate, so RDMA sockets are
+    // pinned for the process lifetime; letting the weak_ptr expire between the
+    // startup queries and model load would churn connections and wedge the device.
+    // (TCP keeps its weak_ptr lifetime; reconnect is cheap.) A pinned socket that
+    // has since broken is dropped here so the next call reconnects.
     static std::vector<std::shared_ptr<socket_t>> pinned;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
-            return sock;
+            if (!sock->is_broken()) {
+                return sock;
+            }
+            sockets.erase(it);
+            pinned.erase(std::remove(pinned.begin(), pinned.end(), sock), pinned.end());
         }
     }
     std::string host;
@@ -2030,9 +2032,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+#ifdef GGML_RPC_RDMA
     if (std::strcmp(name, "ggml_backend_rpc_set_rdma_device") == 0) {
         return (void *)ggml_backend_rpc_set_rdma_device;
     }
+#endif
     return NULL;
 
     GGML_UNUSED(reg);

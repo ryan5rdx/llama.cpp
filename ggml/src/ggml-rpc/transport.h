@@ -15,11 +15,11 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
-    void flush();
+    bool flush();
     bool is_rdma() const;
-    // Pin the local RDMA device for THIS connection (overrides auto-selection).
-    // A client with several RDMA links uses this to face the right peer per worker.
-    // Must be set before the caps handshake. No-op without RDMA.
+    bool is_broken() const;
+    // Pin the local RDMA device for THIS connection; see rpc_transport_set_rdma_device.
+    // Must be set before the caps handshake.
     void set_rdma_device(const char * name);
 
     socket_ptr accept();
@@ -39,7 +39,5 @@ private:
 bool rpc_transport_init();
 void rpc_transport_shutdown();
 
-// Pin the local RDMA device by name (e.g. "rdma_en6"), overriding auto-detection
-// and the GGML_RDMA_DEV env var. A host with several RDMA links must select the
-// one facing the peer. NULL/empty clears the override. No-op without RDMA.
+// Process-global default RDMA device; see ggml_backend_rpc_set_rdma_device.
 void rpc_transport_set_rdma_device(const char * name);
