@@ -134,9 +134,14 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 // Thunderbolt link layer's credit-based flow control (TN3205) provides
 // backpressure, so no application-level credit protocol is needed.
 static constexpr uint32_t RDMA_SEG_MAGIC   = 0x52534547u; // "RSEG"
-static constexpr int      RDMA_NBUF        = 16;          // ring depth; self-tuned down if the provider caps it
-static constexpr size_t   RDMA_STRIDE      = 128 * 1024;  // 32 x 4 KiB TB frames; every SEND transfers a full STRIDE
+static constexpr int      RDMA_NBUF        = 16;          // ring depth (buffers per direction)
+static constexpr size_t   RDMA_FRAME       = 4096;        // Thunderbolt frame size
+static constexpr size_t   RDMA_STRIDE      = 128 * 1024;  // every SEND transfers a full STRIDE
+static constexpr uint32_t RDMA_MAX_QP_WR   = 4095;        // TN3205 hardware limit, in frames
 static constexpr uint32_t RDMA_PSN         = 0;
+
+static_assert(RDMA_STRIDE % RDMA_FRAME == 0, "RDMA_STRIDE must be a whole number of frames");
+static constexpr uint32_t RDMA_STRIDE_FRAMES = RDMA_STRIDE / RDMA_FRAME;
 static constexpr uint64_t RDMA_RECV_WR     = 1ull << 20;  // wr_id bit tagging recv completions
 static constexpr uint64_t RDMA_WR_IDX_MASK = 0xffff;      // buffer index in the low bits of wr_id
 static constexpr uint8_t  RDMA_SYNC_READY  = 0x2A;        // readiness-handshake byte (peer activated)
@@ -701,19 +706,53 @@ bool socket_t::impl::rdma_probe() {
 
     rdma->pd = ibv_alloc_pd(ctx);
     if (!rdma->pd) return false;
-    rdma->cq = ibv_create_cq(ctx, RDMA_NBUF * 4, nullptr, nullptr, 0);
+
+    // TN3205: queue depth is counted in 4 KiB frames, not work requests, so an
+    // RDMA_NBUF-deep ring of STRIDE-sized messages needs NBUF * STRIDE_FRAMES.
+    uint32_t max_wr = RDMA_MAX_QP_WR;
+    struct ibv_device_attr da = {};
+    if (ibv_query_device(ctx, &da) == 0 && da.max_qp_wr > 0) {
+        max_wr = (uint32_t)da.max_qp_wr;
+    }
+    uint32_t want_frames = (uint32_t)RDMA_NBUF * RDMA_STRIDE_FRAMES;
+    if (want_frames > max_wr) want_frames = max_wr;
+
+    int cqe = (int)(2 * want_frames + 1);
+    if (da.max_cqe > 0 && cqe > da.max_cqe) cqe = da.max_cqe;
+    rdma->cq = ibv_create_cq(ctx, cqe, nullptr, nullptr, 0);
     if (!rdma->cq) return false;
 
     ibv_qp_init_attr qia = {};
     qia.send_cq = rdma->cq;
     qia.recv_cq = rdma->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr  = RDMA_NBUF + 4;
-    qia.cap.max_recv_wr  = RDMA_NBUF + 4;
+    qia.cap.max_send_wr  = want_frames;
+    qia.cap.max_recv_wr  = want_frames;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     rdma->qp = ibv_create_qp(rdma->pd, &qia);
+    if (!rdma->qp) {
+        // a provider that refuses a depth it cannot honour still works at one frame
+        // per message; fall back so the connection degrades instead of dropping.
+        qia.cap.max_send_wr = qia.cap.max_recv_wr = RDMA_STRIDE_FRAMES;
+        rdma->qp = ibv_create_qp(rdma->pd, &qia);
+    }
     if (!rdma->qp) return false;
+
+    // TN3205: the system may adjust the requested depth, so size the ring from
+    // what was actually granted rather than what was asked for.
+    uint32_t got_frames = qia.cap.max_send_wr;
+    {
+        ibv_qp_attr       qa      = {};
+        ibv_qp_init_attr  granted = {};
+        if (ibv_query_qp(rdma->qp, &qa, IBV_QP_CAP, &granted) == 0) {
+            got_frames = granted.cap.max_send_wr < granted.cap.max_recv_wr
+                       ? granted.cap.max_send_wr : granted.cap.max_recv_wr;
+        }
+    }
+    rdma->nbuf = (int)(got_frames / RDMA_STRIDE_FRAMES);
+    if (rdma->nbuf > RDMA_NBUF) rdma->nbuf = RDMA_NBUF;
+    if (rdma->nbuf < 1)         rdma->nbuf = 1;
 
     {
         ibv_qp_attr a = {};
@@ -751,6 +790,8 @@ bool socket_t::impl::rdma_probe() {
     GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d select=%s\n",
                   matched, port, gid_idx, rdma_local.qpn, (unsigned)pa.lid, 128 << rdma->path_mtu,
                   (dev && dev[0]) ? "pinned" : (gid_matched ? "gid-match" : "first-active"));
+    GGML_LOG_INFO("RDMA(Apple/UC) queue: frames req=%u granted=%u (%u/msg) -> ring=%d x %zu KiB\n",
+                  want_frames, got_frames, RDMA_STRIDE_FRAMES, rdma->nbuf, RDMA_STRIDE / 1024);
     return true;
 }
 
@@ -788,15 +829,14 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint16_t remote_lid, con
         }
     }
 
-    // Self-tune the recv ring: post recvs until the provider refuses
-    // (Apple caps outstanding recv frames per port). Both peers converge to
-    // the same depth since they run identical code.
-    int posted = 0;
-    for (int i = 0; i < RDMA_NBUF; i++) {
-        if (!c->post_recv(i)) { if (posted < 2) { GGML_LOG_ERROR("RDMA(Apple/UC) post_recv failed (only %d)\n", posted); return false; } break; }
-        posted++;
+    // Recvs are posted only now: the controller starts processing them at RTR.
+    // The ring depth was already fixed from the granted frame budget in rdma_probe.
+    for (int i = 0; i < c->nbuf; i++) {
+        if (!c->post_recv(i)) {
+            GGML_LOG_ERROR("RDMA(Apple/UC) post_recv %d/%d failed\n", i, c->nbuf);
+            return false;
+        }
     }
-    c->nbuf = posted;
 
     GGML_LOG_INFO("RDMA(Apple/UC) activated: qpn=%u->%u mtu=%d rx_depth=%d\n",
                   rdma_local.qpn, remote_qpn, 128 << c->path_mtu, c->nbuf);
