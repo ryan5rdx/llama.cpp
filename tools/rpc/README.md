@@ -97,9 +97,25 @@ By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory an
 
 ### RDMA transport
 
-On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated automatically -- no changes to command-line usage are required.
+The RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated during the initial handshake -- no changes to command-line usage are required, and the connection falls back to TCP unless both peers can use RDMA.
 
-RDMA is enabled by default when `libibverbs` is found at build time.
+Two providers are supported, each enabled by default when its library is found at build time:
+
+- **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`.
+- **macOS**: RDMA over Thunderbolt on Apple silicon Macs with Thunderbolt 5, via `librdma`. Requires macOS 26.2 or later, with RDMA enabled once from macOS Recovery via `rdma_ctl enable`. See [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt).
+
+To force plain TCP without rebuilding, set `GGML_RPC_NO_RDMA` on either peer:
+```bash
+$ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
+```
+
+On a host with several RDMA links, the local device facing a given peer is picked automatically by matching the connection's local address against the device GIDs. Override it when that cannot disambiguate, for example when all links share one bridged subnet:
+
+| Option | Applies to | Description |
+| --- | --- | --- |
+| `--rdma-dev NAME` | server | Pin the local RDMA device, e.g. `--rdma-dev rdma_en2`. |
+| `GGML_RDMA_DEV=NAME` | either | Same, as an environment variable. |
+| `GGML_RDMA_DEV_MAP="host1=dev1,host2=dev2"` | client | Per-endpoint pin, keyed by the `--rpc` host. |
 
 ### Troubleshooting
 
