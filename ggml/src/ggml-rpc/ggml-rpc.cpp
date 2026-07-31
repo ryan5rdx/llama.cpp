@@ -391,11 +391,11 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    // Apple UC QPs are single-use and expensive to recreate, so RDMA sockets are
-    // pinned for the process lifetime; letting the weak_ptr expire between the
-    // startup queries and model load would churn connections and wedge the device.
-    // (TCP keeps its weak_ptr lifetime; reconnect is cheap.) A pinned socket that
-    // has since broken is dropped here so the next call reconnects.
+    // RDMA connections are expensive to set up and there is no transparent
+    // reconnect, so keep them alive for the process lifetime rather than letting
+    // the weak_ptr expire between the startup device queries and model load.
+    // (TCP keeps weak_ptr lifetime; reconnecting is cheap.) A pinned socket that
+    // has since broken is unpinned below so the next call reconnects.
     static std::vector<std::shared_ptr<socket_t>> pinned;
 
     auto it = sockets.find(endpoint);

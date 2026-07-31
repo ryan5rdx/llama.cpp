@@ -15,11 +15,15 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    // Must be called at every message boundary: the RDMA transport coalesces
+    // writes into fixed-size frames and posts the trailing partial frame only
+    // here. No-op on TCP.
     bool flush();
     bool is_rdma() const;
+    // True once the RDMA connection has failed; the caller should drop the socket.
     bool is_broken() const;
-    // Pin the local RDMA device for THIS connection; see rpc_transport_set_rdma_device.
-    // Must be set before the caps handshake.
+    // Pin the local RDMA device for this connection, overriding
+    // rpc_transport_set_rdma_device(). Must be set before the caps handshake.
     void set_rdma_device(const char * name);
 
     socket_ptr accept();
