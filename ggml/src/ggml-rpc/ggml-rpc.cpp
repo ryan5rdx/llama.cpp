@@ -311,6 +311,14 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->send_data(input, input_size)) {
         return false;
     }
+    // SET_TENSOR is the only command issued repeatedly with no reply in between:
+    // the scheduler uploads every graph input before calling graph_compute. Not
+    // flushing lets those uploads share transport frames instead of each ending
+    // one. Everything still buffered is flushed by the graph_compute that
+    // follows, by any command that reads a reply, or by synchronize().
+    if (cmd == RPC_CMD_SET_TENSOR) {
+        return true;
+    }
     return sock->flush();
 }
 
@@ -721,8 +729,14 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
-    GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    // There are no async operations, but the transport may be holding buffered
+    // writes (see send_rpc_cmd), so push them out before the caller treats the
+    // backend as idle.
+    ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
+    auto sock = get_socket(ctx->endpoint);
+    if (sock != nullptr) {
+        sock->flush();
+    }
 }
 
 static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
