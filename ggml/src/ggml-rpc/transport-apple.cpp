@@ -12,23 +12,22 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// Apple RDMA-over-Thunderbolt (Apple TN3205). A coalescing byte stream of
-// fixed-size frames. Vocabulary below: a "frame" is one SEND/RECV unit of
-// RDMA_STRIDE bytes; a "Thunderbolt frame" is always spelled out and is 4 KiB.
+// Apple RDMA-over-Thunderbolt (see Apple TN3205).
 //
-// Four provider rules shape this code:
-//   - only IBV_WR_SEND on UC queue pairs, and no RDMA-CM, so endpoints
-//     (GID/QPN/LID) are exchanged over the bootstrap TCP socket;
-//   - a SEND and the RECV it lands in must cover the same number of Thunderbolt
-//     frames, so every SEND posts a whole STRIDE even when partly filled;
-//   - the controller holds a SEND until the peer has posted a matching RECV
-//     (hardware credit-based flow control), so there is no application-level
-//     credit protocol here;
-//   - a queue pair only processes receives once it reaches RTR, so activate()
-//     runs a readiness handshake before either side sends its first frame.
+// Apple's RDMA is quite different from what's supported in Linux - deserving of its own transport implementation.
+// see https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt for details
+// at a high level the main differences are:
+// UC(unreliable connection) on Apple vs RC(reliable connection) QP transport types on Linux (though in practice UC on Apple is still lossless)
+// fixed 128KiB stride on Apple vs variable chunk size on Linux
+// relying on Apple's hardware credit based flow control vs RNR NAKs + retries on Linux
+//
+// on Apple a SEND and its corresponding RECV must cover the same number of 4 KiB Thunderbolt frames,
+// so every SEND posts a whole 128KiB stride over the wire, even when partially filled.
+// (In testing 128KiB was the best performing among 32, 64, 128, 256)
+
 static constexpr uint32_t RDMA_SEG_MAGIC   = 0x52534547u; // "RSEG"
 static constexpr int      RDMA_NBUF        = 16;          // ring depth (frames per direction)
-static constexpr size_t   RDMA_FRAME       = 4096;        // Thunderbolt frame
+static constexpr size_t   RDMA_FRAME       = 4096;        // Thunderbolt frame (fixed on Apple)
 static constexpr size_t   RDMA_STRIDE      = 128 * 1024;  // 32 Thunderbolt frames; NBUF x this = 2 MiB pinned per direction
 static constexpr uint32_t RDMA_PSN         = 0;           // any value works if both sides match: UC has no retransmit
 static constexpr size_t   RDMA_GID_SIZE    = 16;
@@ -74,7 +73,7 @@ struct apple_rdma::impl {
     struct { int buf; uint32_t off; uint32_t len; } inq[RDMA_NBUF] = {};
     int      inq_head = 0;
     int      inq_count = 0;
-    int      pend_buf = -1;            // send buffer accumulating coalesced writes, or -1
+    int      pend_buf = -1;
     uint32_t pend_len = 0;
     bool     broken = false;
 
@@ -115,9 +114,8 @@ struct apple_rdma::impl {
 
     ~impl() {
         broken = true;
-        // Reverse dependency order. The QP must be destroyed before the memory it
-        // can still write to is deregistered and freed: ERR only starts flushing
-        // the posted WQEs, and a single CQ drain does not prove they are all done.
+        // the QP must be destroyed before the memory it can still write to is
+        // deregistered and freed: ERR only starts flushing the posted WQEs
         if (qp) {
             struct ibv_qp_attr a = {};
             a.qp_state = IBV_QPS_ERR;

@@ -369,11 +369,8 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    // RDMA connections are expensive to set up and there is no transparent
-    // reconnect, so keep them alive for the process lifetime rather than letting
-    // the weak_ptr expire between the startup device queries and model load.
-    // (TCP keeps weak_ptr lifetime; reconnecting is cheap.) A pinned socket that
-    // has since broken is unpinned below so the next call reconnects.
+    // RDMA connections are expensive to setup/teardown, so keep them alive
+    // for the process lifetime, otherwise we see spam setups/teardowns on startup
     static std::vector<std::shared_ptr<socket_t>> pinned;
 
     auto it = sockets.find(endpoint);
@@ -696,8 +693,7 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     // There are no async operations, but the transport may be holding buffered
-    // writes (see send_rpc_cmd), so push them out before the caller treats the
-    // backend as idle.
+    // writes (see send_rpc_cmd), so flush here for safety
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     auto sock = get_socket(ctx->endpoint);
     if (sock != nullptr) {

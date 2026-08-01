@@ -4,18 +4,13 @@
 #include <cstdint>
 #include <memory>
 
-// Apple RDMA-over-Thunderbolt (UC) transport, negotiated by socket_t over the
-// bootstrap TCP connection. See transport-apple.cpp for the provider constraints.
 struct apple_rdma {
-    // Opens the local device whose GID is target_gid, creates the queue pair and
-    // writes the local endpoint into caps (RPC_CONN_CAPS_SIZE bytes). Null if the
-    // device is unusable; fd is kept as the liveness anchor.
+    // target_gid is 16 bytes in, caps is RPC_CONN_CAPS_SIZE bytes out.
     static std::unique_ptr<apple_rdma> probe(int fd, const uint8_t * target_gid, uint8_t * caps);
     ~apple_rdma();
 
-    // Connect to the peer endpoint in caps, which must come from a peer that
-    // advertised RDMA: both sides run a readiness handshake over the bootstrap
-    // socket before this returns.
+    // Peer endpoint from its caps, which must be non-zero: this blocks on a
+    // readiness handshake over fd that the peer only joins if it also has RDMA.
     bool activate(const uint8_t * caps);
 
     bool send(const void * data, size_t size);
