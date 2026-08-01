@@ -29,7 +29,7 @@
 static constexpr uint32_t RDMA_SEG_MAGIC   = 0x52534547u; // "RSEG"
 static constexpr int      RDMA_NBUF        = 16;          // ring depth (frames per direction)
 static constexpr size_t   RDMA_FRAME       = 4096;        // Thunderbolt frame
-static constexpr size_t   RDMA_STRIDE      = 64 * 1024;   // 8 Thunderbolt frames; NBUF x this = 512 KiB pinned per direction
+static constexpr size_t   RDMA_STRIDE      = 32 * 1024;   // 8 Thunderbolt frames; NBUF x this = 512 KiB pinned per direction
 static constexpr uint32_t RDMA_PSN         = 0;           // any value works if both sides match: UC has no retransmit
 static constexpr size_t   RDMA_GID_SIZE    = 16;
 
