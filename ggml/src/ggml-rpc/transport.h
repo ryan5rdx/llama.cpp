@@ -22,9 +22,6 @@ struct socket_t {
     bool is_rdma() const;
     // True once the RDMA connection has failed; the caller should drop the socket.
     bool is_broken() const;
-    // Pin the local RDMA device for this connection, overriding
-    // rpc_transport_set_rdma_device(). Must be set before the caps handshake.
-    void set_rdma_device(const char * name);
 
     socket_ptr accept();
 
@@ -42,6 +39,3 @@ private:
 
 bool rpc_transport_init();
 void rpc_transport_shutdown();
-
-// Process-global default RDMA device; see ggml_backend_rpc_set_rdma_device.
-void rpc_transport_set_rdma_device(const char * name);

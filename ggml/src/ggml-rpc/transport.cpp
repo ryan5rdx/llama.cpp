@@ -15,20 +15,23 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <netdb.h>
-#  include <poll.h>
 #  include <unistd.h>
 #endif
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
-#include <string>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
 #  include <array>
-#  include <cerrno>
 #  include <time.h>
+#  ifndef _WIN32
+#    include <poll.h>
+#  endif
+#  ifdef GGML_RPC_RDMA_APPLE
+#    include "transport-apple.h"
+#  endif
 #endif // GGML_RPC_RDMA
 
 #ifdef _WIN32
@@ -43,11 +46,6 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
-// Local RDMA device pinned via rpc_transport_set_rdma_device() (e.g. from the
-// worker's --rdma-dev). Overrides the GGML_RDMA_DEV env var; empty = auto-select.
-static std::mutex  g_rdma_device_mu;
-static std::string g_rdma_device;   // guarded by g_rdma_device_mu
-
 #ifdef GGML_RPC_RDMA
 static constexpr size_t RDMA_GID_SIZE = 16;            // RoCE GID / IB GID is always 16 bytes
 using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
@@ -55,7 +53,7 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
-static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 x 256 KiB = 6 MiB
+static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
 
 struct rdma_conn {
     struct ibv_context * ctx = nullptr;
@@ -123,131 +121,6 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 
 #endif // GGML_RPC_RDMA && !GGML_RPC_RDMA_APPLE
 
-#ifdef GGML_RPC_RDMA_APPLE
-// Apple RDMA-over-Thunderbolt (Apple TN3205). A coalescing byte stream of
-// fixed-size frames. Vocabulary below: a "frame" is one SEND/RECV unit of
-// RDMA_STRIDE bytes; a "Thunderbolt frame" is always spelled out and is 4 KiB.
-//
-// Four provider rules shape this code:
-//   - only IBV_WR_SEND on UC queue pairs, and no RDMA-CM, so endpoints
-//     (GID/QPN/LID) are exchanged over the bootstrap TCP socket;
-//   - a SEND and the RECV it lands in must cover the same number of Thunderbolt
-//     frames, so every SEND posts a whole STRIDE even when partly filled;
-//   - the controller holds a SEND until the peer has posted a matching RECV
-//     (hardware credit-based flow control), so there is no application-level
-//     credit protocol here;
-//   - a queue pair only processes receives once it reaches RTR, so update_caps
-//     runs a readiness handshake before either side sends its first frame.
-static constexpr uint32_t RDMA_SEG_MAGIC   = 0x52534547u; // "RSEG"
-static constexpr int      RDMA_NBUF        = 16;          // ring depth (frames per direction)
-static constexpr size_t   RDMA_FRAME       = 4096;        // Thunderbolt frame
-static constexpr size_t   RDMA_STRIDE      = 128 * 1024;  // 32 Thunderbolt frames; NBUF x this = 2 MiB pinned per direction
-static constexpr uint32_t RDMA_MAX_QP_WR   = 4095;        // TN3205 queue-depth limit, counted in Thunderbolt frames
-static constexpr uint32_t RDMA_PSN         = 0;           // any value works if both sides match: UC has no retransmit
-
-static_assert(RDMA_STRIDE % RDMA_FRAME == 0, "RDMA_STRIDE must be a whole number of frames");
-static constexpr uint32_t RDMA_STRIDE_FRAMES = RDMA_STRIDE / RDMA_FRAME;
-static constexpr uint64_t RDMA_RECV_WR     = 1ull << 20;  // wr_id bit tagging recv completions
-static constexpr uint64_t RDMA_WR_IDX_MASK = 0xffff;      // buffer index in the low bits of wr_id
-static constexpr uint8_t  RDMA_SYNC_READY  = 0x2A;        // readiness-handshake byte (peer activated)
-
-struct rdma_seg_hdr {
-    uint32_t magic; // RDMA_SEG_MAGIC; a mismatch means the stream desynced
-    uint32_t len;   // payload bytes in this frame; the rest of the stride is padding
-};
-static constexpr size_t RDMA_PAYLOAD = RDMA_STRIDE - sizeof(rdma_seg_hdr);
-
-struct rdma_conn {
-    struct ibv_context * ctx = nullptr;
-    struct ibv_pd * pd = nullptr;
-    struct ibv_cq * cq = nullptr;     // one CQ for both directions; RDMA_RECV_WR tags recv completions
-    struct ibv_qp * qp = nullptr;
-
-    uint8_t       * send_mem = nullptr;
-    struct ibv_mr * send_mr  = nullptr;
-    uint8_t       * recv_mem = nullptr;
-    struct ibv_mr * recv_mr  = nullptr;
-
-    int      nbuf = 0;                   // ring depth granted by the provider
-    int      send_busy[RDMA_NBUF] = {};  // 1 while this buffer has a send in flight
-    // completed recv frames, oldest first: ring index, bytes already handed to
-    // the reader, and total payload length
-    struct { int buf; uint32_t off; uint32_t len; } inq[RDMA_NBUF] = {};
-    int      inq_head = 0;
-    int      inq_count = 0;
-    int      pend_buf = -1;            // send buffer accumulating coalesced writes, or -1
-    uint32_t pend_len = 0;
-    bool     broken = false;
-    uint8_t      port = 0;
-    int          gid_idx = 0;
-    enum ibv_mtu path_mtu = IBV_MTU_1024;
-
-    bool post_recv(int i) {
-        struct ibv_sge sge = {};
-        sge.addr   = (uintptr_t)(recv_mem + (size_t)i * RDMA_STRIDE);
-        sge.length = (uint32_t)RDMA_STRIDE;
-        sge.lkey   = recv_mr->lkey;
-        struct ibv_recv_wr wr = {}, * bad = nullptr;
-        wr.wr_id   = RDMA_RECV_WR | (uint64_t)i;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        return ibv_post_recv(qp, &wr, &bad) == 0;
-    }
-
-    bool post_send(int i, size_t len) {
-        struct ibv_sge sge = {};
-        sge.addr   = (uintptr_t)(send_mem + (size_t)i * RDMA_STRIDE);
-        sge.length = (uint32_t)len;
-        sge.lkey   = send_mr->lkey;
-        struct ibv_send_wr wr = {}, * bad = nullptr;
-        wr.wr_id   = (uint64_t)i;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode  = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        return ibv_post_send(qp, &wr, &bad) == 0;
-    }
-
-    ~rdma_conn() {
-        broken = true;
-        // Reverse dependency order. The QP must be destroyed before the memory it
-        // can still write to is deregistered and freed: ERR only starts flushing
-        // the posted WQEs, and a single CQ drain does not prove they are all done.
-        if (qp) {
-            struct ibv_qp_attr a = {};
-            a.qp_state = IBV_QPS_ERR;
-            ibv_modify_qp(qp, &a, IBV_QP_STATE);
-            struct ibv_wc wc[RDMA_NBUF * 2];
-            while (ibv_poll_cq(cq, RDMA_NBUF * 2, wc) > 0) {}
-            ibv_destroy_qp(qp);
-        }
-        if (send_mr) ibv_dereg_mr(send_mr);
-        if (recv_mr) ibv_dereg_mr(recv_mr);
-        free(send_mem);
-        free(recv_mem);
-        if (cq)  ibv_destroy_cq(cq);
-        if (pd)  ibv_dealloc_pd(pd);
-        if (ctx) ibv_close_device(ctx);
-    }
-};
-
-struct rdma_local_info {
-    uint32_t qpn = 0;
-    uint16_t lid = 0;
-    uint8_t  gid[RDMA_GID_SIZE] = {};
-};
-
-struct rdma_caps {
-    uint32_t qpn;
-    uint16_t lid;
-    uint16_t reserved;
-    uint8_t  gid[RDMA_GID_SIZE];
-};
-
-static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match conn_caps size");
-
-#endif // GGML_RPC_RDMA_APPLE
-
 struct socket_t::impl {
     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
     ~impl();
@@ -259,26 +132,20 @@ struct socket_t::impl {
     void update_caps(const uint8_t * remote_caps);
 
 #ifdef GGML_RPC_RDMA
+    std::optional<rdma_gid_t> rdma_build_target_gid();
+
+#  ifdef GGML_RPC_RDMA_APPLE
+    std::unique_ptr<apple_rdma> rdma;
+#  else
     bool rdma_probe();
     bool rdma_send(const void * data, size_t size);
     bool rdma_recv(void * data, size_t size);
-    // GID-shaped target from this connection's local TCP address (getsockname);
-    // used to auto-select the local device facing the peer on a multi-link host.
-    std::optional<rdma_gid_t> rdma_build_target_gid();
-
-    std::unique_ptr<rdma_conn> rdma;
-    rdma_local_info            rdma_local = {};
-    std::string                conn_rdma_device;   // per-connection device override (highest priority)
-#  ifdef GGML_RPC_RDMA_APPLE
-    bool rdma_activate(uint32_t remote_qpn, uint16_t remote_lid, const uint8_t * remote_gid);
-    int  rdma_progress();
-    bool rdma_acquire_pending();
-    bool rdma_post_pending();
-    bool rdma_flush();
-#  else
     bool tcp_peer_closed();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
     bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc);
+
+    std::unique_ptr<rdma_conn> rdma;
+    rdma_local_info            rdma_local = {};
 #  endif
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
@@ -299,11 +166,13 @@ socket_t::impl::~impl() {
 
 #ifdef GGML_RPC_RDMA
 
-// Build a RoCE GID-shaped 16-byte target from this connection's local TCP
-// address (getsockname). On a host with several RDMA links the local address of
-// the socket to a given peer identifies the interface facing that peer, so the
-// device whose GID equals this target is the one cabled to the peer. Handles
-// IPv4, IPv4-mapped IPv6, and native IPv6 uniformly via a single memcmp.
+// Build a RoCE GID-shaped 16-byte target from a TCP socket's local address.
+// Used to match the socket's local IP against the kernel's GID table so that
+// a single memcmp handles IPv4, IPv4-mapped IPv6, and native IPv6 uniformly:
+//   AF_INET                -> ::ffff:a.b.c.d  (bytes 10-11 = 0xff, last 4 = IPv4)
+//   AF_INET6 (IPv4-mapped) -> ::ffff:a.b.c.d  (already in GID shape)
+//   AF_INET6 (native v6)   -> the 16-byte IPv6 address as-is
+// Returns std::nullopt on unsupported family or getsockname failure.
 std::optional<rdma_gid_t> socket_t::impl::rdma_build_target_gid() {
     sockaddr_storage addr = {};
     socklen_t addr_len = sizeof(addr);
@@ -607,387 +476,14 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 
 #endif // !GGML_RPC_RDMA_APPLE (Linux RC transport)
 
-#ifdef GGML_RPC_RDMA_APPLE
-
-static bool rdma_gid_is_zero(const union ibv_gid * g) {
-    for (size_t i = 0; i < RDMA_GID_SIZE; i++) if (g->raw[i]) return false;
-    return true;
-}
-
-// RoCEv2 IPv4-mapped GID (::ffff:a.b.c.d) - the Thunderbolt link-local address.
-static bool rdma_gid_is_ipv4(const union ibv_gid * g) {
-    for (int i = 0; i < 10; i++) if (g->raw[i]) return false;
-    return g->raw[10] == 0xff && g->raw[11] == 0xff;
-}
-
-// Prefer a RoCEv2 IPv4-mapped GID, else the first non-zero GID. -1 if none.
-static int rdma_select_gid(struct ibv_context * ctx, uint8_t port, int gid_tbl_len, union ibv_gid * out) {
-    int fallback = -1;
-    for (int i = 0; i < gid_tbl_len; i++) {
-        union ibv_gid g;
-        if (ibv_query_gid(ctx, port, i, &g) != 0) continue;
-        if (rdma_gid_is_zero(&g)) continue;
-        if (rdma_gid_is_ipv4(&g)) { if (out) *out = g; return i; }
-        if (fallback < 0) { fallback = i; if (out) *out = g; }
-    }
-    return fallback;
-}
-
-// First ACTIVE port on the device. Only a cabled, up Thunderbolt link reports
-// ACTIVE, and it is not always port 1, so the port cannot be hardcoded the way
-// the Linux path does. Returns 0 if none.
-static uint8_t rdma_first_active_port(struct ibv_context * ctx, struct ibv_port_attr * out) {
-    struct ibv_device_attr da;
-    if (ibv_query_device(ctx, &da) != 0) return 0;
-    for (uint8_t p = 1; p <= da.phys_port_cnt; p++) {
-        struct ibv_port_attr pa;
-        if (ibv_query_port(ctx, p, &pa) != 0) continue;
-        if (pa.state == IBV_PORT_ACTIVE) { if (out) *out = pa; return p; }
-    }
-    return 0;
-}
-
-// Called from get_caps() before the endpoints are exchanged: pick the local
-// device facing this peer, create a UC QP, register the frame rings, and capture
-// the local endpoint. Device selection priority:
-//   1. explicit name (per-connection map / --rdma-dev / GGML_RDMA_DEV);
-//   2. else the device whose GID matches this connection's local TCP address
-//      (auto per-peer selection on a multi-link host - RDMA is point-to-point,
-//      so the wrong local device makes RTR fail with no path);
-//   3. else the first device with an active port and usable GID.
-bool socket_t::impl::rdma_probe() {
-    std::string global_dev;
-    {
-        std::lock_guard<std::mutex> lock(g_rdma_device_mu);
-        global_dev = g_rdma_device;
-    }
-    const char * dev = !conn_rdma_device.empty() ? conn_rdma_device.c_str()
-                     : !global_dev.empty()       ? global_dev.c_str()
-                     :                             std::getenv("GGML_RDMA_DEV");
-    const std::optional<rdma_gid_t> target = rdma_build_target_gid();
-
-    int ndev = 0;
-    ibv_device ** devs = ibv_get_device_list(&ndev);
-    if (!devs || ndev <= 0) { if (devs) ibv_free_device_list(devs); return false; }
-
-    ibv_context * ctx = nullptr;    // currently-chosen device (kept open)
-    uint8_t port = 0;
-    struct ibv_port_attr pa = {};
-    union ibv_gid gid = {};
-    int gid_idx = -1;
-    const char * matched = "";
-    bool gid_matched = false;       // chosen device's GID matches the peer-facing local address
-    for (int d = 0; d < ndev; d++) {
-        const char * name = ibv_get_device_name(devs[d]);
-        if (dev && dev[0] && (!name || strcmp(name, dev) != 0)) continue;
-        ibv_context * c = ibv_open_device(devs[d]);
-        if (!c) continue;
-        struct ibv_port_attr p = {};
-        uint8_t pt = rdma_first_active_port(c, &p);
-        if (!pt) { ibv_close_device(c); continue; }
-        union ibv_gid g = {};
-        int gi = rdma_select_gid(c, pt, p.gid_tbl_len, &g);
-        if (gi < 0) { ibv_close_device(c); continue; }
-
-        const bool this_match = target.has_value() &&
-            memcmp(g.raw, target->data(), RDMA_GID_SIZE) == 0;
-        if (!ctx) {                         // first usable candidate (fallback)
-            ctx = c; port = pt; pa = p; gid = g; gid_idx = gi; matched = name ? name : ""; gid_matched = this_match;
-        } else if (this_match && !gid_matched) {   // peer-facing device: replace fallback
-            ibv_close_device(ctx);
-            ctx = c; port = pt; pa = p; gid = g; gid_idx = gi; matched = name ? name : ""; gid_matched = true;
-        } else {
-            ibv_close_device(c);
-        }
-        if (gid_matched) break;             // the device facing the peer wins outright
-    }
-    ibv_free_device_list(devs);
-    if (!ctx) return false;
-    if (target.has_value() && !gid_matched && (!dev || !dev[0])) {
-        GGML_LOG_INFO("RDMA(Apple/UC) no device GID matched the local address; using first active (%s). "
-                      "On a multi-link host set --rdma-dev / GGML_RDMA_DEV to the device facing this peer.\n", matched);
-    }
-
-    rdma = std::make_unique<rdma_conn>();
-    rdma->ctx = ctx;
-    rdma->port = port;
-    rdma->gid_idx = gid_idx;
-    rdma->path_mtu = pa.active_mtu;
-
-    rdma->pd = ibv_alloc_pd(ctx);
-    if (!rdma->pd) return false;
-
-    // TN3205: queue depth is counted in 4 KiB frames, not work requests, so an
-    // RDMA_NBUF-deep ring of STRIDE-sized messages needs NBUF * STRIDE_FRAMES.
-    uint32_t max_wr = RDMA_MAX_QP_WR;
-    struct ibv_device_attr da = {};
-    if (ibv_query_device(ctx, &da) == 0 && da.max_qp_wr > 0) {
-        max_wr = (uint32_t)da.max_qp_wr;
-    }
-    uint32_t want_frames = (uint32_t)RDMA_NBUF * RDMA_STRIDE_FRAMES;
-    if (want_frames > max_wr) want_frames = max_wr;
-
-    int cqe = (int)(2 * want_frames + 1);
-    if (da.max_cqe > 0 && cqe > da.max_cqe) cqe = da.max_cqe;
-    rdma->cq = ibv_create_cq(ctx, cqe, nullptr, nullptr, 0);
-    if (!rdma->cq) return false;
-
-    ibv_qp_init_attr qia = {};
-    qia.send_cq = rdma->cq;
-    qia.recv_cq = rdma->cq;
-    qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr  = want_frames;
-    qia.cap.max_recv_wr  = want_frames;
-    qia.cap.max_send_sge = 1;
-    qia.cap.max_recv_sge = 1;
-    rdma->qp = ibv_create_qp(rdma->pd, &qia);
-    if (!rdma->qp) {
-        // a provider that refuses a depth it cannot honour still works at one frame
-        // per message; fall back so the connection degrades instead of dropping.
-        qia.cap.max_send_wr = qia.cap.max_recv_wr = RDMA_STRIDE_FRAMES;
-        rdma->qp = ibv_create_qp(rdma->pd, &qia);
-    }
-    if (!rdma->qp) return false;
-
-    // TN3205: the system may adjust the requested depth, so size the ring from
-    // what was actually granted rather than what was asked for.
-    uint32_t got_frames = qia.cap.max_send_wr;
-    {
-        ibv_qp_attr       qa      = {};
-        ibv_qp_init_attr  granted = {};
-        if (ibv_query_qp(rdma->qp, &qa, IBV_QP_CAP, &granted) == 0) {
-            got_frames = granted.cap.max_send_wr < granted.cap.max_recv_wr
-                       ? granted.cap.max_send_wr : granted.cap.max_recv_wr;
-        }
-    }
-    rdma->nbuf = (int)(got_frames / RDMA_STRIDE_FRAMES);
-    if (rdma->nbuf > RDMA_NBUF) rdma->nbuf = RDMA_NBUF;
-    if (rdma->nbuf < 1)         rdma->nbuf = 1;
-
-    {
-        ibv_qp_attr a = {};
-        a.qp_state = IBV_QPS_INIT;
-        a.pkey_index = 0;
-        a.port_num = port;
-        a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-        if (ibv_modify_qp(rdma->qp, &a,
-                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
-            return false;
-        }
-    }
-
-    long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) page = 4096;
-    const size_t ring_bytes = (size_t)RDMA_NBUF * RDMA_STRIDE;
-    if (posix_memalign((void **)&rdma->send_mem, (size_t)page, ring_bytes) != 0) rdma->send_mem = nullptr;
-    if (posix_memalign((void **)&rdma->recv_mem, (size_t)page, ring_bytes) != 0) rdma->recv_mem = nullptr;
-    if (!rdma->send_mem || !rdma->recv_mem) return false;
-
-    // Apple's provider rejects LOCAL_WRITE-only MRs even for two-sided SEND/RECV.
-    const int mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-    rdma->send_mr = ibv_reg_mr(rdma->pd, rdma->send_mem, ring_bytes, mr_flags);
-    rdma->recv_mr = ibv_reg_mr(rdma->pd, rdma->recv_mem, ring_bytes, mr_flags);
-    if (!rdma->send_mr || !rdma->recv_mr) return false;
-
-    // Recvs are posted in rdma_activate() after the RTS transition, not here:
-    // Apple's provider rejects ibv_post_recv on a QP that has not reached RTS.
-
-    rdma_local = {};
-    rdma_local.qpn = rdma->qp->qp_num;
-    rdma_local.lid = pa.lid;
-    memcpy(rdma_local.gid, gid.raw, RDMA_GID_SIZE);
-
-    GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d select=%s\n",
-                  matched, port, gid_idx, rdma_local.qpn, (unsigned)pa.lid, 128 << rdma->path_mtu,
-                  (dev && dev[0]) ? "pinned" : (gid_matched ? "gid-match" : "first-active"));
-    GGML_LOG_INFO("RDMA(Apple/UC) queue: frames req=%u granted=%u (%u/msg) -> ring=%d x %zu KiB\n",
-                  want_frames, got_frames, RDMA_STRIDE_FRAMES, rdma->nbuf, RDMA_STRIDE / 1024);
-    return true;
-}
-
-// Called from update_caps() once the peer's endpoint has arrived: INIT -> RTR ->
-// RTS (UC: GID/GRH addressing, no timeout/retry/rnr/rd_atomic).
-bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint16_t remote_lid, const uint8_t * remote_gid) {
-    rdma_conn * c = rdma.get();
-    {
-        ibv_qp_attr a = {};
-        a.qp_state   = IBV_QPS_RTR;
-        a.path_mtu   = c->path_mtu;
-        a.rq_psn     = RDMA_PSN;
-        a.dest_qp_num = remote_qpn;
-        a.ah_attr.is_global     = 1;
-        a.ah_attr.port_num      = c->port;
-        a.ah_attr.sl            = 0;
-        a.ah_attr.src_path_bits = 0;
-        a.ah_attr.dlid          = remote_lid;
-        a.ah_attr.grh.hop_limit  = 1;
-        a.ah_attr.grh.sgid_index = (uint8_t)c->gid_idx;
-        memcpy(&a.ah_attr.grh.dgid, remote_gid, RDMA_GID_SIZE);
-        if (ibv_modify_qp(c->qp, &a,
-                IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN) != 0) {
-            GGML_LOG_ERROR("RDMA(Apple/UC) RTR failed: %s\n", strerror(errno));
-            return false;
-        }
-    }
-    {
-        ibv_qp_attr a = {};
-        a.qp_state = IBV_QPS_RTS;
-        a.sq_psn   = RDMA_PSN;
-        if (ibv_modify_qp(c->qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
-            GGML_LOG_ERROR("RDMA(Apple/UC) RTS failed: %s\n", strerror(errno));
-            return false;
-        }
-    }
-
-    // Recvs are posted only now: the controller starts processing them at RTR.
-    // The ring depth was already fixed from the granted frame budget in rdma_probe.
-    for (int i = 0; i < c->nbuf; i++) {
-        if (!c->post_recv(i)) {
-            GGML_LOG_ERROR("RDMA(Apple/UC) post_recv %d/%d failed\n", i, c->nbuf);
-            return false;
-        }
-    }
-
-    GGML_LOG_INFO("RDMA(Apple/UC) activated: qpn=%u->%u mtu=%d rx_depth=%d\n",
-                  rdma_local.qpn, remote_qpn, 128 << c->path_mtu, c->nbuf);
-    return true;
-}
-
-// Drain the CQ: release completed send buffers, queue completed recv frames for
-// the reader. Returns the number of completions reaped, or -1 on error.
-int socket_t::impl::rdma_progress() {
-    rdma_conn * c = rdma.get();
-    struct ibv_wc wc[RDMA_NBUF * 2];
-    int n = ibv_poll_cq(c->cq, RDMA_NBUF * 2, wc);
-    if (n < 0) { GGML_LOG_ERROR("RDMA(Apple/UC) poll_cq failed\n"); c->broken = true; return -1; }
-    for (int j = 0; j < n; j++) {
-        uint64_t id = wc[j].wr_id;
-        bool is_recv = (id & RDMA_RECV_WR) != 0;
-        if (wc[j].status != IBV_WC_SUCCESS) {
-            GGML_LOG_ERROR("RDMA(Apple/UC) %s wc error: status=%d\n", is_recv ? "recv" : "send", wc[j].status);
-            c->broken = true;
-            return -1;
-        }
-        if (is_recv) {
-            int b = (int)(id & RDMA_WR_IDX_MASK);
-            const rdma_seg_hdr * h = (const rdma_seg_hdr *)(c->recv_mem + (size_t)b * RDMA_STRIDE);
-            if (h->magic != RDMA_SEG_MAGIC) { GGML_LOG_ERROR("RDMA(Apple/UC) bad frame magic\n"); c->broken = true; return -1; }
-            if (h->len > RDMA_PAYLOAD) { GGML_LOG_ERROR("RDMA(Apple/UC) frame len %u exceeds payload\n", h->len); c->broken = true; return -1; }
-            int slot = (c->inq_head + c->inq_count) % c->nbuf;
-            c->inq[slot].buf  = b;
-            c->inq[slot].off  = 0;
-            c->inq[slot].len  = h->len;
-            c->inq_count++;
-        } else {
-            c->send_busy[(int)(id & RDMA_WR_IDX_MASK)] = 0;
-        }
-    }
-    return n;
-}
-
-// Reserve a free send buffer to coalesce into, waiting on progress if none free.
-bool socket_t::impl::rdma_acquire_pending() {
-    rdma_conn * c = rdma.get();
-    if (c->pend_buf >= 0) return true;
-    for (;;) {
-        if (c->broken) return false;
-        for (int k = 0; k < c->nbuf; k++) if (!c->send_busy[k]) { c->pend_buf = k; c->pend_len = 0; return true; }
-        if (rdma_progress() < 0) return false;
-    }
-}
-
-// Post the pending frame. The whole STRIDE goes out even when only partly filled:
-// TN3205 requires a SEND and its matching RECV to cover the same number of
-// Thunderbolt frames, so a short send would fail the peer's receive.
-bool socket_t::impl::rdma_post_pending() {
-    rdma_conn * c = rdma.get();
-    if (c->pend_buf < 0) return true;
-    int i = c->pend_buf;
-    rdma_seg_hdr * h = (rdma_seg_hdr *)(c->send_mem + (size_t)i * RDMA_STRIDE);
-    h->magic = RDMA_SEG_MAGIC;
-    h->len   = c->pend_len;
-    if (!c->post_send(i, RDMA_STRIDE)) { c->broken = true; return false; }
-    c->send_busy[i] = 1;
-    c->pend_buf = -1;
-    c->pend_len = 0;
-    return true;
-}
-
-// Coalescing write: append into the pending frame, posting a full frame when it
-// fills. The trailing partial is posted by flush() at each message boundary.
-bool socket_t::impl::rdma_send(const void * data, size_t size) {
-    rdma_conn * c = rdma.get();
-    const uint8_t * p = (const uint8_t *)data;
-    while (size > 0) {
-        if (c->broken) return false;
-        if (!rdma_acquire_pending()) return false;
-        uint8_t * sb = c->send_mem + (size_t)c->pend_buf * RDMA_STRIDE;
-        size_t space = RDMA_PAYLOAD - c->pend_len;
-        size_t chunk = size < space ? size : space;
-        memcpy(sb + sizeof(rdma_seg_hdr) + c->pend_len, p, chunk);
-        c->pend_len += (uint32_t)chunk;
-        p += chunk;
-        size -= chunk;
-        if (c->pend_len == RDMA_PAYLOAD) { if (!rdma_post_pending()) return false; }
-    }
-    return true;
-}
-
-bool socket_t::impl::rdma_recv(void * data, size_t size) {
-    rdma_conn * c = rdma.get();
-    uint8_t * p = (uint8_t *)data;
-    if (!rdma_post_pending()) return false;   // turnaround: flush the coalesced request
-    unsigned idle = 0;
-    while (size > 0) {
-        if (c->inq_count == 0) {
-            if (c->broken) return false;
-            int n = rdma_progress();
-            if (n < 0) return false;
-            if (n == 0) {
-                // UC gives no disconnect notification, so the bootstrap TCP fd is
-                // the liveness anchor: nothing crosses it once RDMA is up, so any
-                // readability means the peer's FIN (macOS has no POLLRDHUP).
-                // Same idle interval as the Linux path.
-                if ((++idle & 0xFFFFF) == 0) {
-                    struct pollfd pfd = { fd, POLLIN, 0 };
-                    if (poll(&pfd, 1, 0) > 0 &&
-                        (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-                        return false;
-                    }
-                }
-            } else {
-                idle = 0;
-            }
-            continue;
-        }
-        idle = 0;
-        int slot = c->inq_head;
-        int b = c->inq[slot].buf;
-        uint32_t avail = c->inq[slot].len - c->inq[slot].off;
-        uint32_t take = (size < (size_t)avail) ? (uint32_t)size : avail;
-        memcpy(p, c->recv_mem + (size_t)b * RDMA_STRIDE + sizeof(rdma_seg_hdr) + c->inq[slot].off, take);
-        p += take;
-        size -= take;
-        c->inq[slot].off += take;
-        if (c->inq[slot].off == c->inq[slot].len) {
-            if (!c->post_recv(b)) { c->broken = true; return false; }
-            c->inq_head = (c->inq_head + 1) % c->nbuf;
-            c->inq_count--;
-        }
-    }
-    return true;
-}
-
-bool socket_t::impl::rdma_flush() {
-    return rdma ? rdma_post_pending() : true;
-}
-
-#endif // GGML_RPC_RDMA_APPLE
-
 #endif // GGML_RPC_RDMA
 
 bool socket_t::impl::send_data(const void * data, size_t size) {
-#ifdef GGML_RPC_RDMA
+#ifdef GGML_RPC_RDMA_APPLE
+    if (use_rdma) {
+        return rdma->send(data, size);
+    }
+#elif defined(GGML_RPC_RDMA)
     if (use_rdma) {
         return rdma_send(data, size);
     }
@@ -1007,7 +503,11 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
 }
 
 bool socket_t::impl::recv_data(void * data, size_t size) {
-#ifdef GGML_RPC_RDMA
+#ifdef GGML_RPC_RDMA_APPLE
+    if (use_rdma) {
+        return rdma->recv(data, size);
+    }
+#elif defined(GGML_RPC_RDMA)
     if (use_rdma) {
         return rdma_recv(data, size);
     }
@@ -1033,60 +533,54 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
 void socket_t::impl::get_caps(uint8_t * local_caps) {
     memset(local_caps, 0, RPC_CONN_CAPS_SIZE);
 #ifdef GGML_RPC_RDMA
+    if (std::getenv("GGML_RPC_NO_RDMA")) {
+        return;
+    }
+#  ifdef GGML_RPC_RDMA_APPLE
+    auto target_gid = rdma_build_target_gid();
+    if (target_gid) {
+        rdma = apple_rdma::probe(fd, target_gid->data(), local_caps);
+    }
+#  else
     rdma_local = {};
-    if (!std::getenv("GGML_RPC_NO_RDMA") && rdma_probe()) {
+    if (rdma_probe()) {
         rdma_caps rc = {};
         rc.qpn = rdma_local.qpn;
-#  ifdef GGML_RPC_RDMA_APPLE
-        rc.lid = rdma_local.lid;
-#  else
         rc.psn = rdma_local.psn;
-#  endif
         memcpy(rc.gid, rdma_local.gid, RDMA_GID_SIZE);
         memcpy(local_caps, &rc, sizeof(rc));
     } else {
         rdma.reset();
     }
+#  endif
 #endif // GGML_RPC_RDMA
 }
 
 void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 #ifdef GGML_RPC_RDMA
-    if (!rdma) {
-        return;
+    // a peer that has no RDMA advertises all-zero caps and takes no further part
+    // in the negotiation, so drop to TCP without reporting a failure
+    bool remote_rdma = false;
+    for (size_t i = 0; i < RPC_CONN_CAPS_SIZE; i++) {
+        remote_rdma |= remote_caps[i] != 0;
     }
-    rdma_caps rc = {};
-    memcpy(&rc, remote_caps, sizeof(rc));
-    if (rc.qpn == 0) {
+    if (!rdma || !remote_rdma) {
         rdma.reset();
         return;
     }
 #  ifdef GGML_RPC_RDMA_APPLE
-    bool activated = rdma_activate(rc.qpn, rc.lid, rc.gid);
-    // Readiness handshake, still over TCP (use_rdma is set only on success below).
-    // A queue pair processes receives only after RTR, and rdma_activate() can fail
-    // on one side alone, so upgrade only once both peers report posted recvs.
-    uint8_t local_ready = activated ? RDMA_SYNC_READY : 0;
-    uint8_t peer_ready  = 0;
-    if (!send_data(&local_ready, sizeof(local_ready)) ||
-        !recv_data(&peer_ready, sizeof(peer_ready))) {
-        rdma.reset();
-        return;
-    }
-    if (activated && peer_ready == RDMA_SYNC_READY) {
-        use_rdma = true;
-    } else {
-        GGML_LOG_ERROR("RDMA activation not mutual, staying on TCP\n");
-        rdma.reset();
-    }
+    bool activated = rdma->activate(remote_caps);
 #  else
-    if (rdma_activate(rc.qpn, rc.psn, rc.gid)) {
+    rdma_caps rc = {};
+    memcpy(&rc, remote_caps, sizeof(rc));
+    bool activated = rdma_activate(rc.qpn, rc.psn, rc.gid);
+#  endif
+    if (activated) {
         use_rdma = true;
     } else {
         GGML_LOG_ERROR("RDMA activate failed, staying on TCP\n");
         rdma.reset();
     }
-#  endif
 #else
     (void)remote_caps;
 #endif // GGML_RPC_RDMA
@@ -1095,7 +589,7 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 bool socket_t::impl::flush() {
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
-        return rdma_flush();
+        return rdma->flush();
     }
 #endif
     return true;
@@ -1103,12 +597,11 @@ bool socket_t::impl::flush() {
 
 bool socket_t::impl::is_broken() const {
 #ifdef GGML_RPC_RDMA_APPLE
-    return use_rdma && rdma && rdma->broken;
+    return use_rdma && rdma && rdma->broken();
 #else
     return false;
 #endif
 }
-
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -1134,14 +627,6 @@ bool socket_t::is_rdma() const {
 
 bool socket_t::is_broken() const {
     return pimpl->is_broken();
-}
-
-void socket_t::set_rdma_device(const char * name) {
-#ifdef GGML_RPC_RDMA
-    pimpl->conn_rdma_device = (name && name[0]) ? name : "";
-#else
-    (void)name;
-#endif
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
@@ -1234,11 +719,6 @@ socket_ptr socket_t::connect(const char * host, int port) {
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
-}
-
-void rpc_transport_set_rdma_device(const char * name) {
-    std::lock_guard<std::mutex> lock(g_rdma_device_mu);
-    g_rdma_device = (name && name[0]) ? name : "";
 }
 
 #ifdef _WIN32

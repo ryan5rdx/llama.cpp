@@ -104,18 +104,12 @@ Two providers are supported, each enabled by default when its library is found a
 - **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`.
 - **macOS**: RDMA over Thunderbolt on Apple silicon Macs with Thunderbolt 5, via `librdma`. Requires macOS 26.2 or later, with RDMA enabled once from macOS Recovery via `rdma_ctl enable`. See [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt).
 
+RDMA is point-to-point, so each side uses the local device whose GID matches the address the connection was made on. Connect over the RDMA-capable link -- with Thunderbolt, use the peer's Thunderbolt address in `--rpc`; a connection made over another interface stays on TCP.
+
 To force plain TCP without rebuilding, set `GGML_RPC_NO_RDMA` on either peer:
 ```bash
 $ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
 ```
-
-On a host with several RDMA links, the local device facing a given peer is picked automatically by matching the connection's local address against the device GIDs. Override it when that cannot disambiguate, for example when all links share one bridged subnet:
-
-| Option | Applies to | Description |
-| --- | --- | --- |
-| `--rdma-dev NAME` | server | Pin the local RDMA device, e.g. `--rdma-dev rdma_en2`. |
-| `GGML_RDMA_DEV=NAME` | either | Same, as an environment variable. |
-| `GGML_RDMA_DEV_MAP="host1=dev1,host2=dev2"` | client | Per-endpoint pin, keyed by the `--rpc` host. |
 
 ### Troubleshooting
 
