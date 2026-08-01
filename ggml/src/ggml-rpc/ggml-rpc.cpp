@@ -314,8 +314,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     // SET_TENSOR is the only command issued repeatedly with no reply in between:
     // the scheduler uploads every graph input before calling graph_compute. Not
     // flushing lets those uploads share transport frames instead of each ending
-    // one. Everything still buffered is flushed by the graph_compute that
-    // follows, by any command that reads a reply, or by synchronize().
+    // one. Small coalescing optimization.
     if (cmd == RPC_CMD_SET_TENSOR) {
         return true;
     }
@@ -369,21 +368,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    // RDMA connections are expensive to set up and there is no transparent
-    // reconnect, so keep them alive for the process lifetime rather than letting
-    // the weak_ptr expire between the startup device queries and model load.
-    // (TCP keeps weak_ptr lifetime; reconnecting is cheap.) A pinned socket that
-    // has since broken is unpinned below so the next call reconnects.
-    static std::vector<std::shared_ptr<socket_t>> pinned;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
+            // there is no transparent reconnect, so a socket whose transport has
+            // failed is dropped here and replaced by a fresh connection
             if (!sock->is_broken()) {
                 return sock;
             }
             sockets.erase(it);
-            pinned.erase(std::remove(pinned.begin(), pinned.end(), sock), pinned.end());
         }
     }
     std::string host;
@@ -405,9 +399,6 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     sockets[endpoint] = sock;
-    if (sock->is_rdma()) {
-        pinned.push_back(sock);
-    }
     return sock;
 }
 
