@@ -126,6 +126,7 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    bool flush();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
@@ -479,8 +480,7 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 bool socket_t::impl::send_data(const void * data, size_t size) {
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
-        // post every send: the caller does not mark message boundaries
-        return rdma->send(data, size) && rdma->flush();
+        return rdma->send(data, size);
     }
 #elif defined(GGML_RPC_RDMA)
     if (use_rdma) {
@@ -585,6 +585,15 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 #endif // GGML_RPC_RDMA
 }
 
+bool socket_t::impl::flush() {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (use_rdma) {
+        return rdma->flush();
+    }
+#endif
+    return true;
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 socket_t::socket_t(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
@@ -597,6 +606,10 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+bool socket_t::flush() {
+    return pimpl->flush();
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
