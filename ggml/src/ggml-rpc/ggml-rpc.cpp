@@ -253,10 +253,7 @@ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
         return false;
     }
-    if (!sock->send_data(msg, msg_size)) {
-        return false;
-    }
-    return sock->flush();
+    return sock->send_data(msg, msg_size);
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
@@ -311,7 +308,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->send_data(input, input_size)) {
         return false;
     }
-    return sock->flush();
+    return true;
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
