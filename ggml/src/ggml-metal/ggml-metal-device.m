@@ -2372,7 +2372,10 @@ static const char * ggml_metal_fence_src =
     "}\n"
     "kernel void kernel_fence_publish(\n"
     "        volatile coherent(system) device uint * flag [[buffer(0)]],\n"
-    "        constant uint & value [[buffer(1)]]) {\n"
+    "        constant uint & value [[buffer(1)]],\n"
+    "        device const uint * dep [[buffer(2)]]) {\n"
+    "    // reading dep is what orders this after whoever last wrote that buffer\n"
+    "    if (dep[0] == 0xffffffffu) { flag[1] = 1; }\n"
     "    metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
     "                               metal::memory_order_seq_cst, metal::thread_scope_system);\n"
     "    flag[0] = value;\n"
@@ -2383,17 +2386,20 @@ static const char * ggml_metal_fence_src =
     "        volatile coherent(system) device uint * release [[buffer(0)]],\n"
     "        constant uint & value [[buffer(1)]],\n"
     "        constant uint & max_iters [[buffer(2)]],\n"
-    "        volatile coherent(system) device uint * timeout [[buffer(3)]]) {\n"
+    "        volatile coherent(system) device uint * timeout [[buffer(3)]],\n"
+    "        device uint * guard [[buffer(4)]]) {\n"
     "    for (uint i = 0; i < max_iters; i++) {\n"
     "        metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
     "                                   metal::memory_order_seq_cst, metal::thread_scope_system);\n"
     "        if (release[0] == value) {\n"
     "            metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
     "                                       metal::memory_order_seq_cst, metal::thread_scope_system);\n"
+    "            guard[0] = value;\n"
     "            return;\n"
     "        }\n"
     "    }\n"
     "    timeout[0] = 1u;\n"
+    "    guard[0] = value;\n"
     "}\n";
 
 struct ggml_metal_fence {
@@ -2466,42 +2472,33 @@ volatile uint32_t * ggml_metal_fence_words(ggml_metal_fence_t f) {
     return f ? (volatile uint32_t *) f->words.contents : NULL;
 }
 
-// one thread is deliberate: two threadgroups cost several times more of a busy GPU
-static bool ggml_metal_fence_dispatch(ggml_metal_fence_t f,
-        struct ggml_metal_pipeline_with_params ppl, int word, uint32_t * args, int n_args) {
-    if (f == NULL) {
-        return false;
+// one thread is deliberate: two threadgroups cost several times more of a busy GPU.
+//
+// Both entry points take a buffer they touch purely for ordering. Metal tracks hazards
+// per buffer across command buffers, so touching the same buffer as the producer or the
+// consumer is what places this command buffer on the right side of it.
+static id<MTLComputeCommandEncoder> ggml_metal_fence_begin(ggml_metal_fence_t f,
+        struct ggml_metal_pipeline_with_params ppl, id<MTLCommandBuffer> * cmd_buf_out) {
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(f->dev);
+    id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+    [enc setComputePipelineState:((struct ggml_metal_pipeline *) ppl.pipeline)->obj];
+
+    *cmd_buf_out = cmd_buf;
+
+    return enc;
+}
+
+static void ggml_metal_fence_end(ggml_metal_fence_t f, id<MTLCommandBuffer> cmd_buf, id<MTLComputeCommandEncoder> enc) {
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [enc endEncoding];
+    [cmd_buf commit];
+
+    if (f->cmd_buf_last) {
+        [f->cmd_buf_last release];
     }
-
-    @autoreleasepool {
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(f->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-
-        ggml_metal_encoder_t enc = ggml_metal_encoder_init(cmd_buf, false);
-
-        ggml_metal_encoder_set_pipeline(enc, ppl);
-        ggml_metal_encoder_set_buffer(enc,
-            (struct ggml_metal_buffer_id) { f->words, word*sizeof(uint32_t) }, 0);
-        for (int i = 0; i < n_args; i++) {
-            ggml_metal_encoder_set_bytes(enc, &args[i], sizeof(args[i]), i + 1);
-        }
-        if (n_args == 2) {
-            ggml_metal_encoder_set_buffer(enc,
-                (struct ggml_metal_buffer_id) { f->words, GGML_METAL_FENCE_WORD_TIMEOUT*sizeof(uint32_t) }, 3);
-        }
-        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
-        ggml_metal_encoder_end_encoding(enc);
-        ggml_metal_encoder_free(enc);
-
-        [cmd_buf commit];
-
-        if (f->cmd_buf_last) {
-            [f->cmd_buf_last release];
-        }
-        f->cmd_buf_last = [cmd_buf retain];
-    }
-
-    return true;
+    f->cmd_buf_last = [cmd_buf retain];
 }
 
 void ggml_metal_fence_sync(ggml_metal_fence_t f) {
@@ -2510,16 +2507,42 @@ void ggml_metal_fence_sync(ggml_metal_fence_t f) {
     }
 }
 
-bool ggml_metal_fence_publish(ggml_metal_fence_t f, uint32_t value) {
-    uint32_t args[1] = { value };
+bool ggml_metal_fence_publish(ggml_metal_fence_t f, uint32_t value, struct ggml_metal_buffer_id dep) {
+    if (f == NULL || dep.metal == NULL) {
+        return false;
+    }
 
-    return ggml_metal_fence_dispatch(f, f ? f->ppl_publish : (struct ggml_metal_pipeline_with_params) {0},
-                                     GGML_METAL_FENCE_WORD_ARRIVAL, args, 1);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd_buf = nil;
+        id<MTLComputeCommandEncoder> enc = ggml_metal_fence_begin(f, f->ppl_publish, &cmd_buf);
+
+        [enc setBuffer:f->words offset:GGML_METAL_FENCE_WORD_ARRIVAL*sizeof(uint32_t) atIndex:0];
+        [enc setBytes:&value length:sizeof(value) atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>) dep.metal offset:dep.offs atIndex:2];
+
+        ggml_metal_fence_end(f, cmd_buf, enc);
+    }
+
+    return true;
 }
 
-bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_iters) {
-    uint32_t args[2] = { value, max_iters };
+bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_iters, struct ggml_metal_buffer_id guard) {
+    if (f == NULL || guard.metal == NULL) {
+        return false;
+    }
 
-    return ggml_metal_fence_dispatch(f, f ? f->ppl_wait : (struct ggml_metal_pipeline_with_params) {0},
-                                     GGML_METAL_FENCE_WORD_RELEASE, args, 2);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd_buf = nil;
+        id<MTLComputeCommandEncoder> enc = ggml_metal_fence_begin(f, f->ppl_wait, &cmd_buf);
+
+        [enc setBuffer:f->words offset:GGML_METAL_FENCE_WORD_RELEASE*sizeof(uint32_t) atIndex:0];
+        [enc setBytes:&value length:sizeof(value) atIndex:1];
+        [enc setBytes:&max_iters length:sizeof(max_iters) atIndex:2];
+        [enc setBuffer:f->words offset:GGML_METAL_FENCE_WORD_TIMEOUT*sizeof(uint32_t) atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>) guard.metal offset:guard.offs atIndex:4];
+
+        ggml_metal_fence_end(f, cmd_buf, enc);
+    }
+
+    return true;
 }

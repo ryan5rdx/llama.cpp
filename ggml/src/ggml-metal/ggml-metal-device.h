@@ -339,11 +339,13 @@ ggml_metal_fence_t  ggml_metal_fence_init (ggml_metal_device_t dev); // NULL if 
 void                ggml_metal_fence_free (ggml_metal_fence_t f);
 volatile uint32_t * ggml_metal_fence_words(ggml_metal_fence_t f);
 
-// store value into the arrival word once everything queued so far has run
-bool ggml_metal_fence_publish(ggml_metal_fence_t f, uint32_t value);
+// Store value into the arrival word. dep is read purely for ordering: Metal tracks
+// hazards per buffer, so this runs after whatever last wrote dep's buffer.
+bool ggml_metal_fence_publish(ggml_metal_fence_t f, uint32_t value, struct ggml_metal_buffer_id dep);
 
-// spin until the release word reads value; bounded, and sets the timeout word on expiry
-bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_iters);
+// Spin until the release word reads value; bounded, and sets the timeout word on expiry.
+// guard is written on both exits, so work that reads guard's buffer runs after this.
+bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_iters, struct ggml_metal_buffer_id guard);
 
 // wait for the last publish or arm. ggml_backend_synchronize does not cover these,
 // so read the timeout word only after this returns

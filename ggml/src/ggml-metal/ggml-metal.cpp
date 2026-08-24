@@ -919,16 +919,34 @@ static volatile uint32_t * ggml_backend_metal_fence_words(void * fence) {
     return ggml_metal_fence_words((ggml_metal_fence_t)fence);
 }
 
-static bool ggml_backend_metal_fence_publish(void * fence, uint32_t value) {
-    return ggml_metal_fence_publish((ggml_metal_fence_t)fence, value);
+static struct ggml_metal_buffer_id ggml_backend_metal_buf_id(const ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_metal(t->buffer)) {
+        return { nullptr, 0 };
+    }
+
+    return ggml_metal_buffer_get_id((ggml_metal_buffer_t)t->buffer->context, t);
 }
 
-static bool ggml_backend_metal_fence_arm(void * fence, uint32_t value, uint32_t max_iters) {
-    return ggml_metal_fence_arm((ggml_metal_fence_t)fence, value, max_iters);
+static bool ggml_backend_metal_fence_publish(void * fence, uint32_t value, const ggml_tensor * dep) {
+    return ggml_metal_fence_publish((ggml_metal_fence_t)fence, value, ggml_backend_metal_buf_id(dep));
+}
+
+static bool ggml_backend_metal_fence_arm(void * fence, uint32_t value, uint32_t max_iters, const ggml_tensor * guard) {
+    return ggml_metal_fence_arm((ggml_metal_fence_t)fence, value, max_iters, ggml_backend_metal_buf_id(guard));
 }
 
 static void ggml_backend_metal_fence_sync(void * fence) {
     ggml_metal_fence_sync((ggml_metal_fence_t)fence);
+}
+
+// true when a host write to this buffer lands directly, with no queued blit. A fenced
+// producer/consumer handoff needs that: a blit would be queued behind the consumer.
+static bool ggml_backend_metal_fence_buffer_direct(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_metal(buffer)) {
+        return false;
+    }
+
+    return ggml_metal_buffer_is_shared((ggml_metal_buffer_t)buffer->context);
 }
 
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
@@ -952,6 +970,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_fence_sync") == 0) {
         return (void *)ggml_backend_metal_fence_sync;
+    }
+    if (strcmp(name, "ggml_backend_fence_buffer_direct") == 0) {
+        return (void *)ggml_backend_metal_fence_buffer_direct;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;
