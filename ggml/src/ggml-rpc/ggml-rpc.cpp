@@ -25,6 +25,40 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
+// GGML_RPC_PROFILE=N reports the allreduce gate cost every N gates (default 256).
+// The gate runs once per reduction boundary, so it is the hot path under -sm tensor.
+static const char * RPC_PROFILE = std::getenv("GGML_RPC_PROFILE");
+
+// Small f32 gates are decode, large bf16 ones are prefill. They differ by orders of
+// magnitude, so a combined average says nothing - keep a bucket per kind.
+struct rpc_gate_bucket {
+    int64_t wait_us   = 0; // gpu sync: waiting for the partial to land
+    int64_t pack_us   = 0; // read the partial out of device memory
+    int64_t exch_us   = 0; // send to the peer and receive its partial
+    int64_t unpack_us = 0; // write the peer partial into device memory
+    int64_t submit_us = 0; // encode and enqueue the reduce
+    int64_t bytes     = 0;
+    int64_t n_gates   = 0;
+};
+
+static rpc_gate_bucket g_gate_prof[2]; // [0] = f32 decode, [1] = bf16 prefill
+static int64_t         g_gate_prof_period = 0;
+static int64_t         g_gate_prof_total  = 0;
+
+static void rpc_gate_prof_report() {
+    static const char * kind_name[2] = { "decode/f32", "prefill/bf16" };
+    for (int k = 0; k < 2; k++) {
+        const rpc_gate_bucket & b = g_gate_prof[k];
+        if (b.n_gates == 0) {
+            continue;
+        }
+        const double n = (double) b.n_gates;
+        GGML_LOG_INFO("rpc: allreduce %-12s %6" PRId64 " gates: wait %7.1f pack %6.1f exch %7.1f unpack %6.1f submit %6.1f us, %7.1f KiB\n",
+                      kind_name[k], b.n_gates, b.wait_us/n, b.pack_us/n, b.exch_us/n,
+                      b.unpack_us/n, b.submit_us/n, b.bytes/n/1024.0);
+    }
+}
+
 
 namespace fs = std::filesystem;
 
@@ -1909,8 +1943,15 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     };
 
+    const bool prof = RPC_PROFILE != nullptr;
+    auto tick = [prof]() -> int64_t { return prof ? ggml_time_us() : 0; };
+
+    const int64_t t_start = tick();
+
     // wait for the pending subgraph that produced this partial
     ggml_backend_synchronize(backend);
+
+    const int64_t t_synced = tick();
 
     ggml_tensor * t_wire_send = nullptr;
     ggml_tensor * t_wire_recv = nullptr;
@@ -1923,6 +1964,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     } else {
         ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
     }
+
+    const int64_t t_packed = tick();
 
     // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
     if (state.rank == 0) {
@@ -1937,6 +1980,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         }
     }
 
+    const int64_t t_exchanged = tick();
+
     ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
     ggml_tensor * t_cast = nullptr;
     if (wire_bf16) {
@@ -1945,6 +1990,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     } else {
         ggml_backend_tensor_set(t_peer, state.recv_buf.data(), 0, wire_bytes);
     }
+
+    const int64_t t_unpacked = tick();
 
     ggml_tensor * t_red = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
     t_red->op     = GGML_OP_ADD;
@@ -1958,6 +2005,26 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         compute_nodes(t_cast, t_red);
     } else {
         compute_nodes(t_red, nullptr);
+    }
+
+    if (prof) {
+        if (g_gate_prof_period == 0) {
+            g_gate_prof_period = atol(RPC_PROFILE);
+            if (g_gate_prof_period <= 0) {
+                g_gate_prof_period = 256;
+            }
+        }
+        rpc_gate_bucket & b = g_gate_prof[wire_bf16 ? 1 : 0];
+        b.wait_us   += t_synced      - t_start;
+        b.pack_us   += t_packed      - t_synced;
+        b.exch_us   += t_exchanged   - t_packed;
+        b.unpack_us += t_unpacked    - t_exchanged;
+        b.submit_us += ggml_time_us() - t_unpacked;
+        b.bytes     += wire_bytes;
+        b.n_gates++;
+        if (++g_gate_prof_total % g_gate_prof_period == 0) {
+            rpc_gate_prof_report();
+        }
     }
     return true;
 }
