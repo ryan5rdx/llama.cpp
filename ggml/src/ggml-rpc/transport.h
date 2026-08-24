@@ -23,6 +23,10 @@ struct socket_t {
     // Zero-copy send: register the region once, then send_from takes the payload from it
     // directly. Both return false where the transport cannot do it, and the caller falls
     // back to send_data.
+    // Ask for a small frame size: a whole frame goes on the wire however little of it
+    // is filled, so a link carrying small messages wants this and a bulk link does not.
+    void prefer_small_frames();
+
     // unblock a peer sitting in recv_data on another thread
     void shutdown_rw();
 

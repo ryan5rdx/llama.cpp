@@ -596,6 +596,16 @@ bool socket_t::impl::flush() {
 
 // Zero-copy send. Only the Apple RDMA transport implements it; everywhere else the
 // caller keeps using send_data.
+// Ask for a small frame size on this link, before caps are exchanged. Only the Apple
+// transport pads to a fixed frame, so it is a no-op elsewhere.
+void socket_t::prefer_small_frames() {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->rdma) {
+        pimpl->rdma->prefer_small_frames();
+    }
+#endif
+}
+
 // Break a peer blocked in recv on another thread, so teardown cannot hang on it.
 void socket_t::shutdown_rw() {
 #ifdef _WIN32

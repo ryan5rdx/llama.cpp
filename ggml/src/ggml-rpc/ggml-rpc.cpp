@@ -1967,6 +1967,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             state.peer = nullptr;
             return true;
         }
+        // this link carries gate partials and small control messages, never bulk
+        state.peer->prefer_small_frames();
         state.peer->get_caps(local_caps);
         if (!state.peer->send_data(local_caps, sizeof(local_caps))) {
             state.peer = nullptr;
@@ -1986,6 +1988,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             GGML_LOG_ERROR("[%s] failed to connect to peer %s:%u\n", __func__, host.c_str(), request.port);
             return true;
         }
+        // this link carries gate partials and small control messages, never bulk
+        state.peer->prefer_small_frames();
         state.peer->get_caps(local_caps);
         if (!state.peer->send_data(local_caps, sizeof(local_caps)) ||
             !state.peer->recv_data(remote_caps, sizeof(remote_caps))) {

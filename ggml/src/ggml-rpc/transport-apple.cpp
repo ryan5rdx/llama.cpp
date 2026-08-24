@@ -28,15 +28,21 @@
 // (In testing 128KiB was the best performing among 32, 64, 128, 256)
 
 static constexpr uint32_t RDMA_SEG_MAGIC   = 0x52534547u; // "RSEG"
-static constexpr int      RDMA_NBUF        = 16;          // ring depth (frames per direction)
+static constexpr int      RDMA_NBUF_MAX    = 64;          // most ring slots a small stride can use
 static constexpr size_t   RDMA_FRAME       = 4096;        // Thunderbolt frame (fixed on Apple)
-static constexpr size_t   RDMA_STRIDE      = 128 * 1024;  // 32 Thunderbolt frames; NBUF x this = 2 MiB pinned per direction
+static constexpr size_t   RDMA_STRIDE_MAX  = 128 * 1024;  // 32 Thunderbolt frames
+static constexpr size_t   RDMA_RING_BYTES  = 2 * 1024 * 1024; // pinned per direction, whatever the stride
+// A whole stride goes on the wire however little of it is filled, so a link carrying
+// small messages wants a small one. Bulk uploads want the opposite, so it is per
+// connection: each side advertises a preference and the smaller wins.
+static constexpr size_t   RDMA_STRIDE_SMALL = 16 * 1024;
 static constexpr uint32_t RDMA_PSN         = 0;           // any value works if both sides match: UC has no retransmit
 static constexpr size_t   RDMA_GID_SIZE    = 16;
 
-static_assert(RDMA_STRIDE % RDMA_FRAME == 0, "RDMA_STRIDE must be a whole number of frames");
+static_assert(RDMA_STRIDE_MAX % RDMA_FRAME == 0, "RDMA_STRIDE_MAX must be a whole number of frames");
+static_assert(RDMA_STRIDE_SMALL % RDMA_FRAME == 0, "RDMA_STRIDE_SMALL must be a whole number of frames");
 // TN3205 counts queue depth in Thunderbolt frames, not work requests.
-static constexpr uint32_t RDMA_QP_WR       = (uint32_t)RDMA_NBUF * (RDMA_STRIDE / RDMA_FRAME);
+static constexpr uint32_t RDMA_QP_WR       = (uint32_t)(RDMA_RING_BYTES / RDMA_FRAME);
 static constexpr uint64_t RDMA_RECV_WR     = 1ull << 20;  // wr_id bit tagging recv completions
 // A send straight out of caller memory still has to fill a whole stride, so it goes as
 // header + payload + padding. Two extra scatter entries on top of the payload.
@@ -48,12 +54,12 @@ struct rdma_seg_hdr {
     uint32_t magic; // RDMA_SEG_MAGIC; a mismatch means the stream desynced
     uint32_t len;   // payload bytes in this frame; the rest of the stride is padding
 };
-static constexpr size_t RDMA_PAYLOAD = RDMA_STRIDE - sizeof(rdma_seg_hdr);
+
 
 struct apple_rdma_caps {
     uint32_t qpn;
     uint16_t lid;
-    uint16_t reserved;
+    uint16_t stride_kib;  // frame size this end wants; 0 means the original 128 KiB
     uint8_t  gid[RDMA_GID_SIZE];
 };
 
@@ -72,10 +78,15 @@ struct apple_rdma::impl {
     uint8_t       * recv_mem = nullptr;
     struct ibv_mr * recv_mr  = nullptr;
 
-    int      send_busy[RDMA_NBUF] = {};  // 1 while this buffer has a send in flight
+    size_t   stride = RDMA_STRIDE_MAX;   // negotiated in activate()
+    size_t   payload = RDMA_STRIDE_MAX - sizeof(rdma_seg_hdr);
+    int      nbuf    = (int)(RDMA_RING_BYTES / RDMA_STRIDE_MAX);
+    size_t   stride_pref = RDMA_STRIDE_MAX;
+
+    int      send_busy[RDMA_NBUF_MAX] = {};  // 1 while this buffer has a send in flight
     // completed recv frames, oldest first: ring index, bytes already handed to
     // the reader, and total payload length
-    struct { int buf; uint32_t off; uint32_t len; } inq[RDMA_NBUF] = {};
+    struct { int buf; uint32_t off; uint32_t len; } inq[RDMA_NBUF_MAX] = {};
     int      inq_head = 0;
     int      inq_count = 0;
     int      pend_buf = -1;
@@ -97,8 +108,8 @@ struct apple_rdma::impl {
 
     bool post_recv(int i) {
         struct ibv_sge sge = {};
-        sge.addr   = (uintptr_t)(recv_mem + (size_t)i * RDMA_STRIDE);
-        sge.length = (uint32_t)RDMA_STRIDE;
+        sge.addr   = (uintptr_t)(recv_mem + (size_t)i * stride);
+        sge.length = (uint32_t)stride;
         sge.lkey   = recv_mr->lkey;
         struct ibv_recv_wr wr = {}, * bad = nullptr;
         wr.wr_id   = RDMA_RECV_WR | (uint64_t)i;
@@ -109,8 +120,8 @@ struct apple_rdma::impl {
 
     // Send the whole stride, but take the payload straight from registered caller memory
     // instead of copying it in first. The receive side is unchanged.
-    bool post_send_zc(int i, const void * payload, size_t len, struct ibv_mr * mr) {
-        uint8_t * hdr = send_mem + (size_t)i * RDMA_STRIDE;
+    bool post_send_zc(int i, const void * src, size_t len, struct ibv_mr * mr) {
+        uint8_t * hdr = send_mem + (size_t)i * stride;
         ((rdma_seg_hdr *)hdr)->magic = RDMA_SEG_MAGIC;
         ((rdma_seg_hdr *)hdr)->len   = (uint32_t)len;
 
@@ -118,11 +129,11 @@ struct apple_rdma::impl {
         sge[0].addr   = (uintptr_t)hdr;
         sge[0].length = (uint32_t)sizeof(rdma_seg_hdr);
         sge[0].lkey   = send_mr->lkey;
-        sge[1].addr   = (uintptr_t)payload;
+        sge[1].addr   = (uintptr_t)src;
         sge[1].length = (uint32_t)len;
         sge[1].lkey   = mr->lkey;
         sge[2].addr   = (uintptr_t)(hdr + sizeof(rdma_seg_hdr));
-        sge[2].length = (uint32_t)(RDMA_PAYLOAD - len);
+        sge[2].length = (uint32_t)(payload - len);
         sge[2].lkey   = send_mr->lkey;
 
         struct ibv_send_wr wr = {}, * bad = nullptr;
@@ -136,7 +147,7 @@ struct apple_rdma::impl {
 
     bool post_send(int i, size_t len) {
         struct ibv_sge sge = {};
-        sge.addr   = (uintptr_t)(send_mem + (size_t)i * RDMA_STRIDE);
+        sge.addr   = (uintptr_t)(send_mem + (size_t)i * stride);
         sge.length = (uint32_t)len;
         sge.lkey   = send_mr->lkey;
         struct ibv_send_wr wr = {}, * bad = nullptr;
@@ -156,8 +167,8 @@ struct apple_rdma::impl {
             struct ibv_qp_attr a = {};
             a.qp_state = IBV_QPS_ERR;
             ibv_modify_qp(qp, &a, IBV_QP_STATE);
-            struct ibv_wc wc[RDMA_NBUF * 2];
-            while (ibv_poll_cq(cq, RDMA_NBUF * 2, wc) > 0) {}
+            struct ibv_wc wc[RDMA_NBUF_MAX * 2];
+            while (ibv_poll_cq(cq, RDMA_NBUF_MAX * 2, wc) > 0) {}
             ibv_destroy_qp(qp);
         }
         if (send_mr) ibv_dereg_mr(send_mr);
@@ -289,7 +300,7 @@ std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid
 
     long page = sysconf(_SC_PAGESIZE);
     if (page <= 0) page = 4096;
-    const size_t ring_bytes = (size_t)RDMA_NBUF * RDMA_STRIDE;
+    const size_t ring_bytes = RDMA_RING_BYTES;
     if (posix_memalign((void **)&c->send_mem, (size_t)page, ring_bytes) != 0) c->send_mem = nullptr;
     if (posix_memalign((void **)&c->recv_mem, (size_t)page, ring_bytes) != 0) c->recv_mem = nullptr;
     if (!c->send_mem || !c->recv_mem) return nullptr;
@@ -308,12 +319,13 @@ std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid
     apple_rdma_caps rc = {};
     rc.qpn = c->qpn;
     rc.lid = pa.lid;
+    rc.stride_kib = (uint16_t)(c->stride_pref / 1024);
     memcpy(rc.gid, gid.raw, RDMA_GID_SIZE);
     memcpy(caps, &rc, sizeof(rc));
 
     GGML_LOG_INFO("RDMA(Apple/UC) probed: dev=%s port=%u gid=%d qpn=%u lid=%u mtu=%d ring=%d x %zu KiB\n",
                   matched.c_str(), port, gid_idx, c->qpn, (unsigned)pa.lid, 128 << c->path_mtu,
-                  RDMA_NBUF, RDMA_STRIDE / 1024);
+                  (int)(RDMA_RING_BYTES / c->stride_pref), c->stride_pref / 1024);
     return std::unique_ptr<apple_rdma>(new apple_rdma(std::move(c)));
 }
 
@@ -324,6 +336,21 @@ bool apple_rdma::activate(const uint8_t * caps) {
 
     apple_rdma_caps rc = {};
     memcpy(&rc, caps, sizeof(rc));
+
+    // Both ends must frame identically, so take the smaller preference. A peer that
+    // predates this advertises 0 and gets the original stride.
+    {
+        const size_t peer_pref = rc.stride_kib ? (size_t)rc.stride_kib * 1024 : RDMA_STRIDE_MAX;
+        size_t stride = c->stride_pref < peer_pref ? c->stride_pref : peer_pref;
+        stride = (stride / RDMA_FRAME) * RDMA_FRAME;
+        if (stride < RDMA_FRAME)     stride = RDMA_FRAME;
+        if (stride > RDMA_STRIDE_MAX) stride = RDMA_STRIDE_MAX;
+
+        c->stride  = stride;
+        c->payload = stride - sizeof(rdma_seg_hdr);
+        c->nbuf    = (int)(RDMA_RING_BYTES / stride);
+        if (c->nbuf > RDMA_NBUF_MAX) c->nbuf = RDMA_NBUF_MAX;
+    }
 
     bool ok = true;
     {
@@ -357,9 +384,9 @@ bool apple_rdma::activate(const uint8_t * caps) {
     }
 
     // Recvs are posted only now: the controller starts processing them at RTR.
-    for (int i = 0; ok && i < RDMA_NBUF; i++) {
+    for (int i = 0; ok && i < c->nbuf; i++) {
         if (!c->post_recv(i)) {
-            GGML_LOG_ERROR("RDMA(Apple/UC) post_recv %d/%d failed\n", i, RDMA_NBUF);
+            GGML_LOG_ERROR("RDMA(Apple/UC) post_recv %d/%d failed\n", i, c->nbuf);
             ok = false;
         }
     }
@@ -376,15 +403,15 @@ bool apple_rdma::activate(const uint8_t * caps) {
     }
 
     GGML_LOG_INFO("RDMA(Apple/UC) activated: qpn=%u->%u mtu=%d rx_depth=%d\n",
-                  c->qpn, rc.qpn, 128 << c->path_mtu, RDMA_NBUF);
+                  c->qpn, rc.qpn, 128 << c->path_mtu, c->nbuf);
     return true;
 }
 
 // Drain the CQ: release completed send buffers, queue completed recv frames for
 // the reader. Returns the number of completions reaped, or -1 on error.
 int apple_rdma::impl::progress() {
-    struct ibv_wc wc[RDMA_NBUF * 2];
-    int n = ibv_poll_cq(cq, RDMA_NBUF * 2, wc);
+    struct ibv_wc wc[RDMA_NBUF_MAX * 2];
+    int n = ibv_poll_cq(cq, RDMA_NBUF_MAX * 2, wc);
     if (n < 0) { GGML_LOG_ERROR("RDMA(Apple/UC) poll_cq failed\n"); broken = true; return -1; }
     for (int j = 0; j < n; j++) {
         uint64_t id = wc[j].wr_id;
@@ -396,10 +423,10 @@ int apple_rdma::impl::progress() {
         }
         if (is_recv) {
             int b = (int)(id & RDMA_WR_IDX_MASK);
-            const rdma_seg_hdr * h = (const rdma_seg_hdr *)(recv_mem + (size_t)b * RDMA_STRIDE);
+            const rdma_seg_hdr * h = (const rdma_seg_hdr *)(recv_mem + (size_t)b * stride);
             if (h->magic != RDMA_SEG_MAGIC) { GGML_LOG_ERROR("RDMA(Apple/UC) bad frame magic\n"); broken = true; return -1; }
-            if (h->len > RDMA_PAYLOAD) { GGML_LOG_ERROR("RDMA(Apple/UC) frame len %u exceeds payload\n", h->len); broken = true; return -1; }
-            int slot = (inq_head + inq_count) % RDMA_NBUF;
+            if (h->len > payload) { GGML_LOG_ERROR("RDMA(Apple/UC) frame len %u exceeds payload\n", h->len); broken = true; return -1; }
+            int slot = (inq_head + inq_count) % nbuf;
             inq[slot].buf  = b;
             inq[slot].off  = 0;
             inq[slot].len  = h->len;
@@ -416,7 +443,7 @@ bool apple_rdma::impl::acquire_pending() {
     if (pend_buf >= 0) return true;
     for (;;) {
         if (broken) return false;
-        for (int k = 0; k < RDMA_NBUF; k++) if (!send_busy[k]) { pend_buf = k; pend_len = 0; return true; }
+        for (int k = 0; k < nbuf; k++) if (!send_busy[k]) { pend_buf = k; pend_len = 0; return true; }
         if (progress() < 0) return false;
     }
 }
@@ -427,10 +454,10 @@ bool apple_rdma::impl::acquire_pending() {
 bool apple_rdma::impl::post_pending() {
     if (pend_buf < 0) return true;
     int i = pend_buf;
-    rdma_seg_hdr * h = (rdma_seg_hdr *)(send_mem + (size_t)i * RDMA_STRIDE);
+    rdma_seg_hdr * h = (rdma_seg_hdr *)(send_mem + (size_t)i * stride);
     h->magic = RDMA_SEG_MAGIC;
     h->len   = pend_len;
-    if (!post_send(i, RDMA_STRIDE)) { broken = true; return false; }
+    if (!post_send(i, stride)) { broken = true; return false; }
     send_busy[i] = 1;
     pend_buf = -1;
     pend_len = 0;
@@ -445,14 +472,14 @@ bool apple_rdma::send(const void * data, size_t size) {
     while (size > 0) {
         if (c->broken) return false;
         if (!c->acquire_pending()) return false;
-        uint8_t * sb = c->send_mem + (size_t)c->pend_buf * RDMA_STRIDE;
-        size_t space = RDMA_PAYLOAD - c->pend_len;
+        uint8_t * sb = c->send_mem + (size_t)c->pend_buf * c->stride;
+        size_t space = c->payload - c->pend_len;
         size_t chunk = size < space ? size : space;
         memcpy(sb + sizeof(rdma_seg_hdr) + c->pend_len, p, chunk);
         c->pend_len += (uint32_t)chunk;
         p += chunk;
         size -= chunk;
-        if (c->pend_len == RDMA_PAYLOAD) { if (!c->post_pending()) return false; }
+        if (c->pend_len == c->payload) { if (!c->post_pending()) return false; }
     }
     return true;
 }
@@ -489,13 +516,13 @@ bool apple_rdma::recv(void * data, size_t size) {
         int b = c->inq[slot].buf;
         uint32_t avail = c->inq[slot].len - c->inq[slot].off;
         uint32_t take = (size < (size_t)avail) ? (uint32_t)size : avail;
-        memcpy(p, c->recv_mem + (size_t)b * RDMA_STRIDE + sizeof(rdma_seg_hdr) + c->inq[slot].off, take);
+        memcpy(p, c->recv_mem + (size_t)b * c->stride + sizeof(rdma_seg_hdr) + c->inq[slot].off, take);
         p += take;
         size -= take;
         c->inq[slot].off += take;
         if (c->inq[slot].off == c->inq[slot].len) {
             if (!c->post_recv(b)) { c->broken = true; return false; }
-            c->inq_head = (c->inq_head + 1) % RDMA_NBUF;
+            c->inq_head = (c->inq_head + 1) % c->nbuf;
             c->inq_count--;
         }
     }
@@ -508,6 +535,10 @@ bool apple_rdma::flush() {
 
 // Register caller memory so send_from can take the payload out of it directly. Returns
 // false when the provider will not do it, and the caller keeps using send().
+void apple_rdma::prefer_small_frames() {
+    pimpl->stride_pref = RDMA_STRIDE_SMALL;
+}
+
 bool apple_rdma::zc_register(void * addr, size_t size) {
     impl * c = pimpl.get();
     if (c->broken || c->max_sge < RDMA_ZC_SGE) {
@@ -539,7 +570,7 @@ bool apple_rdma::send_from(const void * base, size_t off, size_t size) {
         return false;
     }
     auto it = c->zc_mrs.find(base);
-    if (it == c->zc_mrs.end() || size > RDMA_PAYLOAD || c->pend_len != 0) {
+    if (it == c->zc_mrs.end() || size > c->payload || c->pend_len != 0) {
         return false; // not registered, too big for one stride, or mid-coalesce
     }
     if (!c->acquire_pending()) {
