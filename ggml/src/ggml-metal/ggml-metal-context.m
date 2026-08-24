@@ -72,6 +72,11 @@ struct ggml_metal {
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
 
+    // Deferred submission. graph_compute encodes here instead of submitting, and anything
+    // that needs results flushes it first, so a run of small dependent graphs costs one
+    // submission. GGML_METAL_NO_BATCH=1 goes back to submitting per graph.
+    id<MTLCommandBuffer> batch_cb;
+
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
@@ -187,6 +192,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 }
 
 void ggml_metal_free(ggml_metal_t ctx) {
+    ggml_metal_batch_flush(ctx);
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
@@ -236,23 +242,42 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
-bool ggml_metal_batch_begin(ggml_metal_t ctx) {
-    return ggml_metal_device_batch_begin(ctx->dev) != NULL;
-}
+// Deferring gives up the immediate submit of the first nodes and the multi-threaded
+// encode of the rest, which is a loss for a caller that submits one graph and waits. It
+// only pays for a caller that submits many small dependent graphs, so it is opt-in.
+static bool ggml_metal_batch_enabled(void) {
+    static int res = -1;
 
-bool ggml_metal_batch_end(ggml_metal_t ctx) {
-    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) ggml_metal_device_batch_commit(ctx->dev);
-    if (cmd_buf == nil) {
-        return false;
+    if (res < 0) {
+        const char * env = getenv("GGML_METAL_BATCH");
+        res = (env && atoi(env) != 0) ? 1 : 0;
     }
 
-    // synchronize() waits on this
-    ctx->cmd_buf_last = cmd_buf;
+    return res != 0;
+}
 
-    return true;
+// Submit whatever has been encoded so far. Every path that reads or writes buffer data
+// calls this first, so deferring can never reorder against it.
+void ggml_metal_batch_flush(ggml_metal_t ctx) {
+    if (ctx->batch_cb == nil) {
+        return;
+    }
+
+    id<MTLCommandBuffer> cmd_buf = ctx->batch_cb;
+
+    ctx->batch_cb = nil;
+    ggml_metal_device_batch_set(ctx->dev, NULL);
+
+    [cmd_buf commit];
+
+    // the retain taken when it was created is the one synchronize releases
+    [ctx->cmd_bufs_ext addObject:cmd_buf];
+    ctx->cmd_buf_last = cmd_buf;
 }
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
+    ggml_metal_batch_flush(ctx);
+
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
@@ -339,6 +364,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
+        ggml_metal_batch_flush(ctx);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -383,6 +409,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
+        ggml_metal_batch_flush(ctx);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -419,6 +446,8 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         // queue the copy operation into the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
+        ggml_metal_batch_flush(ctx_src);
+        ggml_metal_batch_flush(ctx_dst);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx_src->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -460,10 +489,16 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // keep the memory wired for the batched path too
     ggml_metal_device_rsets_keep_alive(ctx->dev);
 
-    // batched: encode into the open buffer and let the batch owner submit it
-    id<MTLCommandBuffer> batch_cb = (id<MTLCommandBuffer>) ggml_metal_device_batch_get(ctx->dev);
-    if (batch_cb != nil) {
+    // Deferred: encode into the open buffer and leave it to be flushed. Anything that
+    // needs results back flushes first, so this cannot reorder against a data access.
+    if (ggml_metal_batch_enabled()) {
         @autoreleasepool {
+            if (ctx->batch_cb == nil) {
+                id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+                ctx->batch_cb = [[queue commandBuffer] retain];
+                ggml_metal_device_batch_set(ctx->dev, ctx->batch_cb);
+            }
+            id<MTLCommandBuffer> batch_cb = ctx->batch_cb;
             ctx->gf = gf;
 
             ggml_metal_op_t ctx_op = ggml_metal_op_init(
@@ -667,6 +702,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
+        ggml_metal_batch_flush(ctx);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
@@ -683,6 +719,7 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
+        ggml_metal_batch_flush(ctx);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 

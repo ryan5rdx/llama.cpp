@@ -320,14 +320,13 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
 //
 // batched submission
 //
-// While a batch is open, ggml_metal_graph_compute encodes into it and does not submit.
-// A caller that makes many small dependent submissions can then pay one submission for
-// all of them. Nesting is not supported; begin returns NULL if a batch is already open.
+// The context defers submission: graph_compute encodes into one open command buffer and
+// anything that needs results flushes it. The open buffer is published here, without
+// ownership, so an inline fence can encode into it too.
 //
 
-ggml_metal_cmd_buf_t ggml_metal_device_batch_begin (ggml_metal_device_t dev);
-ggml_metal_cmd_buf_t ggml_metal_device_batch_get   (ggml_metal_device_t dev); // NULL if none
-ggml_metal_cmd_buf_t ggml_metal_device_batch_commit(ggml_metal_device_t dev);
+void                 ggml_metal_device_batch_set(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf);
+ggml_metal_cmd_buf_t ggml_metal_device_batch_get(ggml_metal_device_t dev); // NULL if none
 
 //
 // fast-sync fence

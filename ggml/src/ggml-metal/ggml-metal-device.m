@@ -827,12 +827,10 @@ struct ggml_metal_device {
 
     struct ggml_metal_device_props props;
 
-    // Open batch command buffer. While one is open, graph_compute encodes into it and
-    // does not submit, so a run of small dependent submissions costs one. It lives on
-    // the device because the queue does, and because an inline fence has to reach the
-    // same buffer as the work it gates.
+    // Non-owning pointer to the context's open batch command buffer, published here so
+    // an inline fence can reach the same buffer as the work it gates. The context owns
+    // the lifetime.
     id<MTLCommandBuffer> batch_cb;
-    id<MTLCommandBuffer> batch_cb_prev; // kept alive until the next batch, for synchronize
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
@@ -2577,36 +2575,11 @@ bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_ite
 // batched submission
 //
 
-ggml_metal_cmd_buf_t ggml_metal_device_batch_begin(ggml_metal_device_t dev) {
-    if (dev->batch_cb != nil) {
-        return NULL; // already open: nesting is not supported
-    }
-
-    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
-
-    dev->batch_cb = [[queue commandBuffer] retain];
-
-    return dev->batch_cb;
+void ggml_metal_device_batch_set(ggml_metal_device_t dev, ggml_metal_cmd_buf_t cmd_buf) {
+    dev->batch_cb = (id<MTLCommandBuffer>) cmd_buf;
 }
 
 ggml_metal_cmd_buf_t ggml_metal_device_batch_get(ggml_metal_device_t dev) {
     return dev->batch_cb;
 }
 
-ggml_metal_cmd_buf_t ggml_metal_device_batch_commit(ggml_metal_device_t dev) {
-    if (dev->batch_cb == nil) {
-        return NULL;
-    }
-
-    id<MTLCommandBuffer> cmd_buf = dev->batch_cb;
-    dev->batch_cb = nil;
-
-    [cmd_buf commit];
-
-    if (dev->batch_cb_prev) {
-        [dev->batch_cb_prev release];
-    }
-    dev->batch_cb_prev = cmd_buf;
-
-    return cmd_buf;
-}

@@ -17,10 +17,9 @@ void ggml_metal_free(ggml_metal_t ctx);
 
 const char * ggml_metal_get_name(ggml_metal_t ctx);
 
-// Defer submission: graph_compute encodes into one open command buffer until
-// batch_end submits it. Amortizes submission over many small dependent graphs.
-bool ggml_metal_batch_begin(ggml_metal_t ctx);
-bool ggml_metal_batch_end  (ggml_metal_t ctx);
+// Submit anything encoded but not yet submitted. Called by every path that reads or
+// writes buffer data, so callers do not need to know deferral happens.
+void ggml_metal_batch_flush(ggml_metal_t ctx);
 
 void ggml_metal_synchronize(ggml_metal_t ctx);
 
