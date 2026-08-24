@@ -17,6 +17,11 @@ void ggml_metal_free(ggml_metal_t ctx);
 
 const char * ggml_metal_get_name(ggml_metal_t ctx);
 
+// Defer submission: graph_compute encodes into one open command buffer until
+// batch_end submits it. Amortizes submission over many small dependent graphs.
+bool ggml_metal_batch_begin(ggml_metal_t ctx);
+bool ggml_metal_batch_end  (ggml_metal_t ctx);
+
 void ggml_metal_synchronize(ggml_metal_t ctx);
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);

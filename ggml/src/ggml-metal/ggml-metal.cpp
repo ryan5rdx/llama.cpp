@@ -919,6 +919,17 @@ static volatile uint32_t * ggml_backend_metal_fence_words(void * fence) {
     return ggml_metal_fence_words((ggml_metal_fence_t)fence);
 }
 
+// Backend-generic names: a backend that can defer submission implements these, and a
+// caller that makes many small dependent submissions asks for them by name. CUDA and
+// Vulkan could implement the same contract over graph capture.
+static bool ggml_backend_metal_batch_begin(ggml_backend_t backend) {
+    return ggml_metal_batch_begin((ggml_metal_t) backend->context);
+}
+
+static bool ggml_backend_metal_batch_end(ggml_backend_t backend) {
+    return ggml_metal_batch_end((ggml_metal_t) backend->context);
+}
+
 static struct ggml_metal_buffer_id ggml_backend_metal_buf_id(const ggml_tensor * t) {
     if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_metal(t->buffer)) {
         return { nullptr, 0 };
@@ -952,6 +963,12 @@ static bool ggml_backend_metal_fence_buffer_direct(ggml_backend_buffer_t buffer)
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_batch_begin") == 0) {
+        return (void *)ggml_backend_metal_batch_begin;
+    }
+    if (strcmp(name, "ggml_backend_batch_end") == 0) {
+        return (void *)ggml_backend_metal_batch_end;
     }
     if (strcmp(name, "ggml_backend_fence_init") == 0) {
         return (void *)ggml_backend_metal_fence_init;

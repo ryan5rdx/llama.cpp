@@ -318,6 +318,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 
 //
+// batched submission
+//
+// While a batch is open, ggml_metal_graph_compute encodes into it and does not submit.
+// A caller that makes many small dependent submissions can then pay one submission for
+// all of them. Nesting is not supported; begin returns NULL if a batch is already open.
+//
+
+ggml_metal_cmd_buf_t ggml_metal_device_batch_begin (ggml_metal_device_t dev);
+ggml_metal_cmd_buf_t ggml_metal_device_batch_get   (ggml_metal_device_t dev); // NULL if none
+ggml_metal_cmd_buf_t ggml_metal_device_batch_commit(ggml_metal_device_t dev);
+
+//
 // fast-sync fence
 //
 // Lets the GPU wait on a word the host stores, so a producer/consumer handoff does not

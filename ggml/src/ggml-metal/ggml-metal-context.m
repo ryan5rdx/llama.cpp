@@ -236,6 +236,22 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+bool ggml_metal_batch_begin(ggml_metal_t ctx) {
+    return ggml_metal_device_batch_begin(ctx->dev) != NULL;
+}
+
+bool ggml_metal_batch_end(ggml_metal_t ctx) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) ggml_metal_device_batch_commit(ctx->dev);
+    if (cmd_buf == nil) {
+        return false;
+    }
+
+    // synchronize() waits on this
+    ctx->cmd_buf_last = cmd_buf;
+
+    return true;
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
@@ -441,14 +457,39 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_FAILED;
     }
 
+    // keep the memory wired for the batched path too
+    ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    // batched: encode into the open buffer and let the batch owner submit it
+    id<MTLCommandBuffer> batch_cb = (id<MTLCommandBuffer>) ggml_metal_device_batch_get(ctx->dev);
+    if (batch_cb != nil) {
+        @autoreleasepool {
+            ctx->gf = gf;
+
+            ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                ctx->dev, batch_cb, gf, 0, gf->n_nodes,
+                ctx->use_fusion, ctx->use_concurrency, ctx->capture_compute,
+                ctx->debug_graph, ctx->debug_fusion);
+
+            for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                const int res = ggml_metal_op_encode(ctx_op, idx);
+                if (res == 0) {
+                    break;
+                }
+                idx += res - 1;
+            }
+
+            ggml_metal_op_free(ctx_op);
+        }
+
+        return GGML_STATUS_SUCCESS;
+    }
+
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
-
-    // keep the memory wired
-    ggml_metal_device_rsets_keep_alive(ctx->dev);
 
     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
     // the first n_nodes_0 are encoded and submitted for processing directly by the calling thread

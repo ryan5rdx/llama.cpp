@@ -827,6 +827,13 @@ struct ggml_metal_device {
 
     struct ggml_metal_device_props props;
 
+    // Open batch command buffer. While one is open, graph_compute encodes into it and
+    // does not submit, so a run of small dependent submissions costs one. It lives on
+    // the device because the queue does, and because an inline fence has to reach the
+    // same buffer as the work it gates.
+    id<MTLCommandBuffer> batch_cb;
+    id<MTLCommandBuffer> batch_cb_prev; // kept alive until the next batch, for synchronize
+
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 };
@@ -2479,8 +2486,13 @@ volatile uint32_t * ggml_metal_fence_words(ggml_metal_fence_t f) {
 // consumer is what places this command buffer on the right side of it.
 static id<MTLComputeCommandEncoder> ggml_metal_fence_begin(ggml_metal_fence_t f,
         struct ggml_metal_pipeline_with_params ppl, id<MTLCommandBuffer> * cmd_buf_out) {
-    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(f->dev);
-    id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+    // Inside a batch the fence must go into the same buffer as the work it gates:
+    // that is what makes the ordering an encoder ordering rather than a hazard.
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) ggml_metal_device_batch_get(f->dev);
+    if (cmd_buf == nil) {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(f->dev);
+        cmd_buf = [queue commandBuffer];
+    }
 
     id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:((struct ggml_metal_pipeline *) ppl.pipeline)->obj];
@@ -2493,6 +2505,12 @@ static id<MTLComputeCommandEncoder> ggml_metal_fence_begin(ggml_metal_fence_t f,
 static void ggml_metal_fence_end(ggml_metal_fence_t f, id<MTLCommandBuffer> cmd_buf, id<MTLComputeCommandEncoder> enc) {
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [enc endEncoding];
+
+    // the batch owner submits; only a standalone fence submits itself
+    if (cmd_buf == (id<MTLCommandBuffer>) ggml_metal_device_batch_get(f->dev)) {
+        return;
+    }
+
     [cmd_buf commit];
 
     if (f->cmd_buf_last) {
@@ -2545,4 +2563,42 @@ bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_ite
     }
 
     return true;
+}
+
+//
+// batched submission
+//
+
+ggml_metal_cmd_buf_t ggml_metal_device_batch_begin(ggml_metal_device_t dev) {
+    if (dev->batch_cb != nil) {
+        return NULL; // already open: nesting is not supported
+    }
+
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(dev);
+
+    dev->batch_cb = [[queue commandBuffer] retain];
+
+    return dev->batch_cb;
+}
+
+ggml_metal_cmd_buf_t ggml_metal_device_batch_get(ggml_metal_device_t dev) {
+    return dev->batch_cb;
+}
+
+ggml_metal_cmd_buf_t ggml_metal_device_batch_commit(ggml_metal_device_t dev) {
+    if (dev->batch_cb == nil) {
+        return NULL;
+    }
+
+    id<MTLCommandBuffer> cmd_buf = dev->batch_cb;
+    dev->batch_cb = nil;
+
+    [cmd_buf commit];
+
+    if (dev->batch_cb_prev) {
+        [dev->batch_cb_prev release];
+    }
+    dev->batch_cb_prev = cmd_buf;
+
+    return cmd_buf;
 }
