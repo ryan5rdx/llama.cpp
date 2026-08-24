@@ -903,9 +903,55 @@ static const char * ggml_backend_metal_tuning_device_token(ggml_backend_dev_t de
     return ggml_metal_device_id_token(ggml_metal_device_get_props(ctx_dev)->device_id);
 }
 
+// fast-sync fence, resolved by name so backend-agnostic callers can fall back when absent
+
+static void * ggml_backend_metal_fence_init(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+
+    return ggml_metal_fence_init((ggml_metal_device_t)dev->context);
+}
+
+static void ggml_backend_metal_fence_free(void * fence) {
+    ggml_metal_fence_free((ggml_metal_fence_t)fence);
+}
+
+static volatile uint32_t * ggml_backend_metal_fence_words(void * fence) {
+    return ggml_metal_fence_words((ggml_metal_fence_t)fence);
+}
+
+static bool ggml_backend_metal_fence_publish(void * fence, uint32_t value) {
+    return ggml_metal_fence_publish((ggml_metal_fence_t)fence, value);
+}
+
+static bool ggml_backend_metal_fence_arm(void * fence, uint32_t value, uint32_t max_iters) {
+    return ggml_metal_fence_arm((ggml_metal_fence_t)fence, value, max_iters);
+}
+
+static void ggml_backend_metal_fence_sync(void * fence) {
+    ggml_metal_fence_sync((ggml_metal_fence_t)fence);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_fence_init") == 0) {
+        return (void *)ggml_backend_metal_fence_init;
+    }
+    if (strcmp(name, "ggml_backend_fence_free") == 0) {
+        return (void *)ggml_backend_metal_fence_free;
+    }
+    if (strcmp(name, "ggml_backend_fence_words") == 0) {
+        return (void *)ggml_backend_metal_fence_words;
+    }
+    if (strcmp(name, "ggml_backend_fence_publish") == 0) {
+        return (void *)ggml_backend_metal_fence_publish;
+    }
+    if (strcmp(name, "ggml_backend_fence_arm") == 0) {
+        return (void *)ggml_backend_metal_fence_arm;
+    }
+    if (strcmp(name, "ggml_backend_fence_sync") == 0) {
+        return (void *)ggml_backend_metal_fence_sync;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

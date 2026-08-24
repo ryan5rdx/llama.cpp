@@ -2350,3 +2350,176 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 
     return res;
 }
+
+//
+// fast-sync fence
+//
+
+// The GPU spins on a word the host stores instead of the host resuming the command
+// processor with a fresh submit. Work queued behind the fence therefore starts without
+// a round trip. Needs coherent(system), which is not documented, so compilation can
+// fail and every entry point degrades to "unavailable". After MLX ml-explore/mlx#1773.
+static const char * ggml_metal_fence_src =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "#pragma METAL internals : enable\n"
+    "#ifndef __METAL_MEMORY_SCOPE_SYSTEM__\n"
+    "#define __METAL_MEMORY_SCOPE_SYSTEM__ 3\n"
+    "#endif\n"
+    "namespace metal {\n"
+    "constexpr constant metal::thread_scope thread_scope_system =\n"
+    "    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);\n"
+    "}\n"
+    "kernel void kernel_fence_publish(\n"
+    "        volatile coherent(system) device uint * flag [[buffer(0)]],\n"
+    "        constant uint & value [[buffer(1)]]) {\n"
+    "    metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
+    "                               metal::memory_order_seq_cst, metal::thread_scope_system);\n"
+    "    flag[0] = value;\n"
+    "    metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
+    "                               metal::memory_order_seq_cst, metal::thread_scope_system);\n"
+    "}\n"
+    "kernel void kernel_fence_wait(\n"
+    "        volatile coherent(system) device uint * release [[buffer(0)]],\n"
+    "        constant uint & value [[buffer(1)]],\n"
+    "        constant uint & max_iters [[buffer(2)]],\n"
+    "        volatile coherent(system) device uint * timeout [[buffer(3)]]) {\n"
+    "    for (uint i = 0; i < max_iters; i++) {\n"
+    "        metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
+    "                                   metal::memory_order_seq_cst, metal::thread_scope_system);\n"
+    "        if (release[0] == value) {\n"
+    "            metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
+    "                                       metal::memory_order_seq_cst, metal::thread_scope_system);\n"
+    "            return;\n"
+    "        }\n"
+    "    }\n"
+    "    timeout[0] = 1u;\n"
+    "}\n";
+
+struct ggml_metal_fence {
+    ggml_metal_device_t dev;
+
+    ggml_metal_library_t lib;
+
+    struct ggml_metal_pipeline_with_params ppl_publish;
+    struct ggml_metal_pipeline_with_params ppl_wait;
+
+    id<MTLBuffer> words;
+
+    // the fence runs on its own command buffers, which the backend context does not
+    // track, so ggml_backend_synchronize does not cover them
+    id<MTLCommandBuffer> cmd_buf_last;
+};
+
+ggml_metal_fence_t ggml_metal_fence_init(ggml_metal_device_t dev) {
+    ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, ggml_metal_fence_src, false);
+    if (lib == NULL) {
+        GGML_LOG_WARN("%s: coherent(system) is not supported here - fast sync disabled\n", __func__);
+        return NULL;
+    }
+
+    struct ggml_metal_pipeline_with_params ppl_publish =
+        ggml_metal_library_compile_pipeline(lib, "kernel_fence_publish", "kernel_fence_publish", nil);
+    struct ggml_metal_pipeline_with_params ppl_wait =
+        ggml_metal_library_compile_pipeline(lib, "kernel_fence_wait", "kernel_fence_wait", nil);
+    if (!ppl_publish.pipeline || !ppl_wait.pipeline) {
+        GGML_LOG_WARN("%s: fence pipelines unavailable - fast sync disabled\n", __func__);
+        ggml_metal_library_free(lib);
+        return NULL;
+    }
+
+    id<MTLDevice> device = ggml_metal_device_get_obj(dev);
+    id<MTLBuffer> words = [device newBufferWithLength:GGML_METAL_FENCE_N_WORDS*sizeof(uint32_t)
+                                              options:MTLResourceStorageModeShared];
+    if (!words) {
+        ggml_metal_library_free(lib);
+        return NULL;
+    }
+    memset(words.contents, 0, GGML_METAL_FENCE_N_WORDS*sizeof(uint32_t));
+
+    ggml_metal_fence_t res = calloc(1, sizeof(struct ggml_metal_fence));
+    res->dev         = dev;
+    res->lib         = lib;
+    res->ppl_publish = ppl_publish;
+    res->ppl_wait    = ppl_wait;
+    res->words       = words;
+
+    GGML_LOG_INFO("%s: fast sync fence enabled\n", __func__);
+
+    return res;
+}
+
+void ggml_metal_fence_free(ggml_metal_fence_t f) {
+    if (f == NULL) {
+        return;
+    }
+    if (f->cmd_buf_last) {
+        [f->cmd_buf_last waitUntilCompleted];
+        [f->cmd_buf_last release];
+    }
+    [f->words release];
+    ggml_metal_library_free(f->lib);
+    free(f);
+}
+
+volatile uint32_t * ggml_metal_fence_words(ggml_metal_fence_t f) {
+    return f ? (volatile uint32_t *) f->words.contents : NULL;
+}
+
+// one thread is deliberate: two threadgroups cost several times more of a busy GPU
+static bool ggml_metal_fence_dispatch(ggml_metal_fence_t f,
+        struct ggml_metal_pipeline_with_params ppl, int word, uint32_t * args, int n_args) {
+    if (f == NULL) {
+        return false;
+    }
+
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(f->dev);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+        ggml_metal_encoder_t enc = ggml_metal_encoder_init(cmd_buf, false);
+
+        ggml_metal_encoder_set_pipeline(enc, ppl);
+        ggml_metal_encoder_set_buffer(enc,
+            (struct ggml_metal_buffer_id) { f->words, word*sizeof(uint32_t) }, 0);
+        for (int i = 0; i < n_args; i++) {
+            ggml_metal_encoder_set_bytes(enc, &args[i], sizeof(args[i]), i + 1);
+        }
+        if (n_args == 2) {
+            ggml_metal_encoder_set_buffer(enc,
+                (struct ggml_metal_buffer_id) { f->words, GGML_METAL_FENCE_WORD_TIMEOUT*sizeof(uint32_t) }, 3);
+        }
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
+        ggml_metal_encoder_end_encoding(enc);
+        ggml_metal_encoder_free(enc);
+
+        [cmd_buf commit];
+
+        if (f->cmd_buf_last) {
+            [f->cmd_buf_last release];
+        }
+        f->cmd_buf_last = [cmd_buf retain];
+    }
+
+    return true;
+}
+
+void ggml_metal_fence_sync(ggml_metal_fence_t f) {
+    if (f && f->cmd_buf_last) {
+        [f->cmd_buf_last waitUntilCompleted];
+    }
+}
+
+bool ggml_metal_fence_publish(ggml_metal_fence_t f, uint32_t value) {
+    uint32_t args[1] = { value };
+
+    return ggml_metal_fence_dispatch(f, f ? f->ppl_publish : (struct ggml_metal_pipeline_with_params) {0},
+                                     GGML_METAL_FENCE_WORD_ARRIVAL, args, 1);
+}
+
+bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_iters) {
+    uint32_t args[2] = { value, max_iters };
+
+    return ggml_metal_fence_dispatch(f, f ? f->ppl_wait : (struct ggml_metal_pipeline_with_params) {0},
+                                     GGML_METAL_FENCE_WORD_RELEASE, args, 2);
+}

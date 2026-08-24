@@ -318,6 +318,38 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 
 //
+// fast-sync fence
+//
+// Lets the GPU wait on a word the host stores, so a producer/consumer handoff does not
+// need the host to wait for a command buffer and then submit the next one. Optional:
+// it needs an undocumented Metal qualifier, so init can fail and the caller must have
+// a command buffer based fallback.
+//
+
+enum {
+    GGML_METAL_FENCE_WORD_ARRIVAL = 0, // gpu -> host: work queued before it has run
+    GGML_METAL_FENCE_WORD_RELEASE = 1, // host -> gpu: work queued after it may run
+    GGML_METAL_FENCE_WORD_TIMEOUT = 2, // set by the gpu when a wait gives up
+    GGML_METAL_FENCE_N_WORDS      = 3,
+};
+
+typedef struct ggml_metal_fence * ggml_metal_fence_t;
+
+ggml_metal_fence_t  ggml_metal_fence_init (ggml_metal_device_t dev); // NULL if unsupported
+void                ggml_metal_fence_free (ggml_metal_fence_t f);
+volatile uint32_t * ggml_metal_fence_words(ggml_metal_fence_t f);
+
+// store value into the arrival word once everything queued so far has run
+bool ggml_metal_fence_publish(ggml_metal_fence_t f, uint32_t value);
+
+// spin until the release word reads value; bounded, and sets the timeout word on expiry
+bool ggml_metal_fence_arm(ggml_metal_fence_t f, uint32_t value, uint32_t max_iters);
+
+// wait for the last publish or arm. ggml_backend_synchronize does not cover these,
+// so read the timeout word only after this returns
+void ggml_metal_fence_sync(ggml_metal_fence_t f);
+
+//
 // device buffers
 //
 
