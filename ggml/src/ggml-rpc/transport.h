@@ -23,6 +23,9 @@ struct socket_t {
     // Zero-copy send: register the region once, then send_from takes the payload from it
     // directly. Both return false where the transport cannot do it, and the caller falls
     // back to send_data.
+    // unblock a peer sitting in recv_data on another thread
+    void shutdown_rw();
+
     bool zc_register(void * addr, size_t size);
     void zc_release();
     bool send_from(const void * base, size_t off, size_t size);

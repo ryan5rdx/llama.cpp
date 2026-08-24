@@ -596,6 +596,15 @@ bool socket_t::impl::flush() {
 
 // Zero-copy send. Only the Apple RDMA transport implements it; everywhere else the
 // caller keeps using send_data.
+// Break a peer blocked in recv on another thread, so teardown cannot hang on it.
+void socket_t::shutdown_rw() {
+#ifdef _WIN32
+    ::shutdown(pimpl->fd, SD_BOTH);
+#else
+    ::shutdown(pimpl->fd, SHUT_RDWR);
+#endif
+}
+
 bool socket_t::zc_register(void * addr, size_t size) {
 #ifdef GGML_RPC_RDMA_APPLE
     if (pimpl->use_rdma) {

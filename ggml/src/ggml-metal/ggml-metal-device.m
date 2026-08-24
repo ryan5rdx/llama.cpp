@@ -2380,9 +2380,12 @@ static const char * ggml_metal_fence_src =
     "kernel void kernel_fence_publish(\n"
     "        volatile coherent(system) device uint * flag [[buffer(0)]],\n"
     "        constant uint & value [[buffer(1)]],\n"
-    "        device const uint * dep [[buffer(2)]]) {\n"
-    "    // reading dep is what orders this after whoever last wrote that buffer\n"
-    "    if (dep[0] == 0xffffffffu) { flag[1] = 1; }\n"
+    "        device const uint * dep [[buffer(2)]],\n"
+    "        device uint * sink [[buffer(3)]]) {\n"
+    "    // The dep read is what orders this after whoever last wrote that buffer, so it\n"
+    "    // must survive optimization: binding a buffer the shader never touches creates\n"
+    "    // no hazard. Park it in a sink word, never in a live fence word.\n"
+    "    sink[0] = dep[0];\n"
     "    metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
     "                               metal::memory_order_seq_cst, metal::thread_scope_system);\n"
     "    flag[0] = value;\n"
@@ -2395,10 +2398,14 @@ static const char * ggml_metal_fence_src =
     "        constant uint & max_iters [[buffer(2)]],\n"
     "        volatile coherent(system) device uint * timeout [[buffer(3)]],\n"
     "        device uint * guard [[buffer(4)]]) {\n"
+    "    if (timeout[0] != 0u) {\n"
+    "        guard[0] = value;\n"
+    "        return;\n"
+    "    }\n"
     "    for (uint i = 0; i < max_iters; i++) {\n"
     "        metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
     "                                   metal::memory_order_seq_cst, metal::thread_scope_system);\n"
-    "        if (release[0] == value) {\n"
+    "        if (release[0] >= value) {\n"
     "            metal::atomic_thread_fence(metal::mem_flags::mem_device,\n"
     "                                       metal::memory_order_seq_cst, metal::thread_scope_system);\n"
     "            guard[0] = value;\n"
@@ -2425,7 +2432,7 @@ struct ggml_metal_fence {
 };
 
 ggml_metal_fence_t ggml_metal_fence_init(ggml_metal_device_t dev) {
-    ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, ggml_metal_fence_src, false);
+    ggml_metal_library_t lib = ggml_metal_library_init_from_source(dev, ggml_metal_fence_src, true);
     if (lib == NULL) {
         GGML_LOG_WARN("%s: coherent(system) is not supported here - fast sync disabled\n", __func__);
         return NULL;
@@ -2537,6 +2544,7 @@ bool ggml_metal_fence_publish(ggml_metal_fence_t f, uint32_t value, struct ggml_
         [enc setBuffer:f->words offset:GGML_METAL_FENCE_WORD_ARRIVAL*sizeof(uint32_t) atIndex:0];
         [enc setBytes:&value length:sizeof(value) atIndex:1];
         [enc setBuffer:(__bridge id<MTLBuffer>) dep.metal offset:dep.offs atIndex:2];
+        [enc setBuffer:f->words offset:GGML_METAL_FENCE_WORD_SINK*sizeof(uint32_t) atIndex:3];
 
         ggml_metal_fence_end(f, cmd_buf, enc);
     }

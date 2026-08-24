@@ -342,7 +342,8 @@ enum {
     GGML_METAL_FENCE_WORD_ARRIVAL = 0, // gpu -> host: work queued before it has run
     GGML_METAL_FENCE_WORD_RELEASE = 1, // host -> gpu: work queued after it may run
     GGML_METAL_FENCE_WORD_TIMEOUT = 2, // set by the gpu when a wait gives up
-    GGML_METAL_FENCE_N_WORDS      = 3,
+    GGML_METAL_FENCE_WORD_SINK    = 3, // scratch, keeps the ordering read from being elided
+    GGML_METAL_FENCE_N_WORDS      = 4,
 };
 
 typedef struct ggml_metal_fence * ggml_metal_fence_t;
