@@ -7,6 +7,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -69,6 +71,14 @@ static bool rpc_fast_sync_requested() {
     return RPC_FAST_SYNC != nullptr && atoi(RPC_FAST_SYNC) != 0;
 }
 
+// GGML_RPC_METAL_BATCH=0 keeps a submission per gate even with fast sync on, which is
+// useful for attributing a regression to the fence or to batching.
+static bool rpc_batch_requested() {
+    const char * env = std::getenv("GGML_RPC_METAL_BATCH");
+
+    return env == nullptr ? true : atoi(env) != 0;
+}
+
 static const rpc_fence_api * rpc_fence_get(ggml_backend_t backend) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     if (reg == nullptr) {
@@ -100,6 +110,16 @@ static inline void rpc_fence_store(volatile uint32_t * w, uint32_t v) {
     std::atomic_thread_fence(std::memory_order_release);
     *w = v;
 }
+
+// One queued gate. The ggml context that produced the tensors is gone by the time the
+// service thread runs, so this carries raw host addresses only.
+struct rpc_gate {
+    uint32_t seq;
+    const void * send_src;
+    void *       recv_dst;
+    size_t       wire_bytes;
+    bool         wire_bf16;
+};
 
 // Bounded so a dead peer cannot leave the command processor spinning until the GPU
 // watchdog kills it. Measured at roughly 1.7M iterations per second on an M1 Max, so
@@ -1078,6 +1098,9 @@ public:
           comm_host(std::move(comm_host)), comm_port(comm_port) {
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
+        for (auto & cs : comm_states) {
+            cs.reset(new comm_state());
+        }
     }
     ~rpc_server();
 
@@ -1099,6 +1122,8 @@ public:
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
+    void batch_begin();
+    bool batch_end();
     bool comm_free(const rpc_msg_comm_free_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
@@ -1111,6 +1136,12 @@ public:
 
 private:
     void sync_all_backends();
+
+    // set once a device has a fence, so batching only engages where gates can be queued
+    bool batch_capable = false;
+    bool batch_open    = false;
+    bool (*batch_fn_begin)(ggml_backend_t) = nullptr;
+    bool (*batch_fn_end)  (ggml_backend_t) = nullptr;
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
@@ -1131,7 +1162,22 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
+
+        // Batched gates. The server thread encodes and queues; the service thread waits
+        // for each gate's arrival, exchanges, and releases it. Without this the server
+        // would have to submit and wait per gate, which is what batching removes.
+        std::thread             service;
+        std::mutex              mtx;
+        std::condition_variable cv;
+        std::deque<rpc_gate>    queue;
+        bool                    service_stop   = false;
+        bool                    service_failed = false;
+        uint32_t                gates_done     = 0;
+        uint32_t                gates_queued   = 0;
     };
+
+    void comm_service(comm_state & state);
+    bool comm_drain  (comm_state & state);
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
@@ -1141,7 +1187,7 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-    std::vector<comm_state> comm_states;
+    std::vector<std::unique_ptr<comm_state>> comm_states;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1851,6 +1897,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
+    batch_begin();
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     sg.graph = graph;
@@ -1869,13 +1916,52 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = it->second.graph;
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
+    batch_begin();
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }
 
 // graph compute is asynchronous; commands that read or write buffer data synchronize first
+// Open on the first graph of a token; the batch stays open until something needs
+// results back, which is exactly where sync_all_backends is already called.
+void rpc_server::batch_begin() {
+    if (!batch_capable || batch_open || backends.size() != 1) {
+        return;
+    }
+    if (batch_fn_begin && batch_fn_begin(backends[0])) {
+        batch_open = true;
+    }
+}
+
+bool rpc_server::batch_end() {
+    if (!batch_open) {
+        return true;
+    }
+    batch_open = false;
+
+    // commit first: until the buffer is submitted the GPU cannot reach any fence, so the
+    // service thread would spin on an arrival that can never happen
+    const bool committed = batch_fn_end && batch_fn_end(backends[0]);
+
+    bool ok = committed;
+    for (auto & cs : comm_states) {
+        if (cs->fence && !comm_drain(*cs)) {
+            ok = false;
+        }
+    }
+    if (!committed) {
+        GGML_LOG_ERROR("[%s] failed to submit the batch\n", __func__);
+    }
+
+    return ok;
+}
+
 void rpc_server::sync_all_backends() {
+    // drain queued gates before waiting on the GPU: it is parked on a fence until the
+    // service thread releases it
+    batch_end();
+
     for (ggml_backend_t backend : backends) {
         ggml_backend_synchronize(backend);
     }
@@ -1888,7 +1974,7 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
         return true;
     }
-    comm_state & state = comm_states[request.device];
+    comm_state & state = *comm_states[request.device];
     if (state.peer != nullptr) {
         response.ok = 1;
         return true;
@@ -1943,17 +2029,130 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     if (state.fence_api && rpc_fast_sync_requested()) {
         state.fence = state.fence_api->init(backends[request.device]);
     }
-    GGML_LOG_INFO("[%s] device %u joined pairwise comm as rank %u, fast sync %s\n",
-                  __func__, request.device, request.rank, state.fence ? "on" : "off");
+    if (state.fence) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[request.device]));
+        batch_fn_begin = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_batch_begin");
+        batch_fn_end   = (bool (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_batch_end");
+        batch_capable  = batch_fn_begin && batch_fn_end && rpc_batch_requested();
+        state.service  = std::thread([this, &state] { comm_service(state); });
+    }
+    GGML_LOG_INFO("[%s] device %u joined pairwise comm as rank %u, fast sync %s, batching %s\n",
+                  __func__, request.device, request.rank,
+                  state.fence ? "on" : "off", batch_capable ? "on" : "off");
     response.ok = 1;
     return true;
+}
+
+// Drains queued gates: wait for the GPU to reach each one, exchange, release it. Runs on
+// its own thread so the server can keep encoding the rest of the token.
+void rpc_server::comm_service(comm_state & state) {
+    volatile uint32_t * fw = state.fence_api->words(state.fence);
+
+    while (true) {
+        rpc_gate g;
+        {
+            std::unique_lock<std::mutex> lock(state.mtx);
+            state.cv.wait(lock, [&] { return state.service_stop || !state.queue.empty(); });
+            if (state.queue.empty()) {
+                return; // stopping
+            }
+            g = state.queue.front();
+            state.queue.pop_front();
+        }
+
+        bool ok;
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            ok = !state.service_failed;
+        }
+
+        const bool prof = RPC_PROFILE != nullptr;
+        const int64_t t_start = prof ? ggml_time_us() : 0;
+
+        if (ok) {
+            // the publish runs after the partial, so observing it means the data is there
+            const int64_t deadline = ggml_time_us() + 30*1000*1000;
+            while (rpc_fence_load(&fw[RPC_FENCE_ARRIVAL]) != g.seq) {
+                if (ggml_time_us() > deadline || state.service_stop) {
+                    GGML_LOG_ERROR("[%s] gate %u never arrived\n", __func__, g.seq);
+                    ok = false;
+                    break;
+                }
+                std::this_thread::yield();
+            }
+        }
+
+        const int64_t t_arrived = prof ? ggml_time_us() : 0;
+
+        if (ok && rpc_fence_load(&fw[RPC_FENCE_TIMEOUT]) != 0) {
+            GGML_LOG_ERROR("[%s] gate %u: a previous fence expired\n", __func__, g.seq);
+            ok = false;
+        }
+
+        if (ok) {
+            if (state.rank == 0) {
+                ok = state.peer->send_data(g.send_src, g.wire_bytes) &&
+                     state.peer->recv_data(g.recv_dst, g.wire_bytes);
+            } else {
+                ok = state.peer->recv_data(g.recv_dst, g.wire_bytes) &&
+                     state.peer->send_data(g.send_src, g.wire_bytes);
+            }
+            if (!ok) {
+                GGML_LOG_ERROR("[%s] gate %u exchange failed\n", __func__, g.seq);
+            }
+        }
+
+        const int64_t t_exchanged = prof ? ggml_time_us() : 0;
+
+        // release even on failure: the reduce is already queued behind this fence and
+        // every later gate is queued behind that, so not releasing wedges the whole batch
+        rpc_fence_store(&fw[RPC_FENCE_RELEASE], g.seq);
+
+        if (prof) {
+            // pack, unpack and submit are structurally zero here: the payload moves
+            // straight to and from device memory and the reduce was encoded already
+            if (g_gate_prof_period == 0) {
+                g_gate_prof_period = atol(RPC_PROFILE);
+                if (g_gate_prof_period <= 0) {
+                    g_gate_prof_period = 256;
+                }
+            }
+            rpc_gate_bucket & b = g_gate_prof[g.wire_bf16 ? 1 : 0];
+            b.wait_us += t_arrived   - t_start;
+            b.exch_us += t_exchanged - t_arrived;
+            b.bytes   += g.wire_bytes;
+            b.n_gates++;
+            if (++g_gate_prof_total % g_gate_prof_period == 0) {
+                rpc_gate_prof_report();
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            if (!ok) {
+                state.service_failed = true;
+            }
+            state.gates_done++;
+        }
+        state.cv.notify_all();
+    }
+}
+
+// Wait for every queued gate to be serviced. Called at a point where the batch has been
+// committed, so the GPU can actually reach the fences.
+bool rpc_server::comm_drain(comm_state & state) {
+    std::unique_lock<std::mutex> lock(state.mtx);
+    // not queue.empty(): the last gate is popped before it is serviced
+    state.cv.wait(lock, [&] { return state.gates_done == state.gates_queued; });
+
+    return !state.service_failed;
 }
 
 bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (request.device >= backends.size()) {
         return false;
     }
-    comm_state & state = comm_states[request.device];
+    comm_state & state = *comm_states[request.device];
     if (state.peer == nullptr) {
         GGML_LOG_ERROR("[%s] no communicator for device %u\n", __func__, request.device);
         return false;
@@ -1988,6 +2187,9 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     const size_t guard_offs = GGML_PAD(wire_bf16 ? 2*nbytes : nbytes, 32);
     const size_t need       = guard_offs + 32;
     if (state.scratch_size < need) {
+        // gates already encoded point into the current scratch, so it cannot be replaced
+        // while the batch that holds them is still open
+        batch_end();
         state.scratch.reset(ggml_backend_alloc_buffer(backend, need));
         state.scratch_size = need;
     }
@@ -2027,6 +2229,88 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     // already queued, so that write must not be a blit queued behind it
     void * const fence = (state.fence && state.fence_api->buffer_direct(state.scratch.get()))
         ? state.fence : nullptr;
+
+    // A host-visible tensor can go on and off the wire in place, which skips the bounce
+    // through send_buf/recv_buf. Worth little on decode payloads but hundreds of
+    // microseconds per gate on prefill ones.
+    auto direct_addr = [&](const ggml_tensor * t) -> void * {
+        if (t == nullptr || state.fence_api == nullptr || !state.fence_api->buffer_direct(t->buffer)) {
+            return nullptr;
+        }
+        return t->data;
+    };
+
+    // wire staging, built up front so the batched path can encode the cast before the
+    // arrival publish: the publish has to order after whatever the host will read
+    ggml_tensor * t_wire_send = wire_bf16 ? new_scratch_tensor(GGML_TYPE_BF16, 0)      : nullptr;
+    ggml_tensor * t_wire_recv = wire_bf16 ? new_scratch_tensor(GGML_TYPE_BF16, ne*2)   : nullptr;
+    ggml_tensor * const t_send = wire_bf16 ? t_wire_send : t_dst;
+    ggml_tensor * const t_recv = t_wire_recv;
+
+    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
+    ggml_tensor * t_cast = wire_bf16 ? new_cpy_node(t_wire_recv, t_peer) : nullptr;
+
+    ggml_tensor * t_red = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
+    t_red->op     = GGML_OP_ADD;
+    t_red->src[0] = t_dst;
+    t_red->src[1] = t_peer;
+    t_red->buffer = t_dst->buffer;
+    t_red->data   = t_dst->data;
+    t_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+    auto submit_reduce = [&]() {
+        if (t_cast != nullptr) {
+            compute_nodes(t_cast, t_red);
+        } else {
+            compute_nodes(t_red, nullptr);
+        }
+    };
+
+    auto arm_fence = [&](uint32_t seq) -> bool {
+        ggml_tensor * t_guard = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        t_guard->buffer = state.scratch.get();
+        t_guard->data   = scratch_base + guard_offs;
+        return state.fence_api->arm(state.fence, seq, rpc_fence_max_iters(), t_guard);
+    };
+
+    // Batched: encode the whole gate and hand it to the service thread. Nothing here
+    // waits, so the server goes straight on to the next chunk of the token.
+    if (batch_open && fence) {
+        const uint32_t seq = ++state.fence_seq;
+
+        if (wire_bf16) {
+            compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
+        }
+
+        void * const send_src = direct_addr(t_send);
+        void * const recv_dst = direct_addr(t_recv ? t_recv : t_peer);
+        if (send_src == nullptr || recv_dst == nullptr) {
+            GGML_LOG_ERROR("[%s] batched gate needs host-visible staging\n", __func__);
+            return false;
+        }
+
+        if (!state.fence_api->publish(fence, seq, t_send) || !arm_fence(seq)) {
+            GGML_LOG_ERROR("[%s] failed to encode gate %u\n", __func__, seq);
+            return false;
+        }
+        submit_reduce();
+
+        rpc_gate g;
+        g.seq        = seq;
+        g.send_src   = send_src;
+        g.recv_dst   = recv_dst;
+        g.wire_bytes = wire_bytes;
+        g.wire_bf16  = wire_bf16;
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.queue.push_back(g);
+            state.gates_queued++;
+        }
+        state.cv.notify_all();
+
+        return true;
+    }
+
     volatile uint32_t * const fw  = fence ? state.fence_api->words(fence) : nullptr;
     const uint32_t      seq = fence ? ++state.fence_seq : 0;
 
@@ -2037,7 +2321,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         // the publish runs after everything already queued, so observing it means the
         // partial has landed - and that the previous gate's reduce has run, which is
         // the first point its timeout word can be trusted
-        if (!state.fence_api->publish(fence, seq, t_dst)) {
+        if (!state.fence_api->publish(fence, seq, t_send)) {
             GGML_LOG_ERROR("[%s] fence publish failed\n", __func__);
             return false;
         }
@@ -2059,26 +2343,10 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     const int64_t t_synced = tick();
 
-    // A host-visible tensor can go on and off the wire in place, which skips the bounce
-    // through send_buf/recv_buf. Worth little on decode payloads but hundreds of
-    // microseconds per gate on prefill ones.
-    auto direct_addr = [&](const ggml_tensor * t) -> void * {
-        if (state.fence_api == nullptr || !state.fence_api->buffer_direct(t->buffer)) {
-            return nullptr;
-        }
-        return t->data;
-    };
-
-    ggml_tensor * t_wire_send = nullptr;
-    ggml_tensor * t_wire_recv = nullptr;
     if (wire_bf16) {
-        t_wire_send = new_scratch_tensor(GGML_TYPE_BF16, 0);
-        t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, ne*2);
         compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
         ggml_backend_synchronize(backend);
     }
-    ggml_tensor * const t_send = wire_bf16 ? t_wire_send : t_dst;
-    ggml_tensor * const t_recv = wire_bf16 ? t_wire_recv : nullptr; // t_peer once it exists
 
     const void * send_src = direct_addr(t_send);
     if (send_src == nullptr) {
@@ -2088,37 +2356,34 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     const int64_t t_packed = tick();
 
-    // The reduce depends on the peer tensors, not on their contents, so it can be built
-    // before the exchange. Under fast sync it is also queued now, behind the fence, so
-    // the encode overlaps the exchange instead of following it.
-    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
-    ggml_tensor * t_cast = wire_bf16 ? new_cpy_node(t_wire_recv, t_peer) : nullptr;
-
-    ggml_tensor * t_red = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
-    t_red->op     = GGML_OP_ADD;
-    t_red->src[0] = t_dst;
-    t_red->src[1] = t_peer;
-    t_red->buffer = t_dst->buffer;
-    t_red->data   = t_dst->data;
-    t_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
-
-    auto submit_reduce = [&]() {
-        if (t_cast != nullptr) {
-            compute_nodes(t_cast, t_red);
-        } else {
-            compute_nodes(t_red, nullptr);
-        }
-    };
-
     if (fence) {
-        ggml_tensor * t_guard = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        t_guard->buffer = state.scratch.get();
-        t_guard->data   = scratch_base + guard_offs;
-        if (!state.fence_api->arm(fence, seq, rpc_fence_max_iters(), t_guard)) {
+        if (!arm_fence(seq)) {
             GGML_LOG_ERROR("[%s] fence arm failed\n", __func__);
             return false;
         }
         submit_reduce();
+    }
+
+    // Batched: everything the gate needs is encoded, so hand it to the service thread and
+    // keep going. The exchange happens once the GPU reaches the fence, by which time the
+    // rest of the token is encoded too.
+    if (batch_open) {
+        rpc_gate g;
+        g.seq        = seq;
+        g.send_src   = send_src;
+        g.recv_dst   = direct_addr(t_recv ? t_recv : t_peer);
+        g.wire_bytes = wire_bytes;
+        g.wire_bf16  = wire_bf16;
+        if (g.recv_dst == nullptr) {
+            GGML_LOG_ERROR("[%s] batched gate needs a host-visible destination\n", __func__);
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.queue.push_back(g);
+        }
+        state.cv.notify_all();
+        return true;
     }
 
     // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
@@ -2184,11 +2449,30 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
     if (request.device >= backends.size()) {
         return false;
     }
-    comm_state & state = comm_states[request.device];
+    comm_state & state = *comm_states[request.device];
+    if (state.service.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(state.mtx);
+            state.service_stop = true;
+        }
+        state.cv.notify_all();
+        state.service.join();
+    }
     if (state.fence) {
         state.fence_api->destroy(state.fence);
+        state.fence = nullptr;
     }
-    comm_states[request.device] = comm_state();
+    state.peer.reset();
+    state.scratch.reset();
+    state.scratch_size = 0;
+    state.rank = 0;
+    state.world = 0;
+    state.fence_seq = 0;
+    state.service_stop = false;
+    state.service_failed = false;
+    state.gates_done = 0;
+    state.gates_queued = 0;
+    state.queue.clear();
     return true;
 }
 
