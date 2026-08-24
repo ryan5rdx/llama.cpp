@@ -20,6 +20,13 @@ struct socket_t {
     // here. No-op on TCP.
     bool flush();
 
+    // Zero-copy send: register the region once, then send_from takes the payload from it
+    // directly. Both return false where the transport cannot do it, and the caller falls
+    // back to send_data.
+    bool zc_register(void * addr, size_t size);
+    void zc_release();
+    bool send_from(const void * base, size_t off, size_t size);
+
     socket_ptr accept();
 
     void get_caps(uint8_t * local_caps);

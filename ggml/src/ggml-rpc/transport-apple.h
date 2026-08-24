@@ -17,6 +17,13 @@ struct apple_rdma {
     bool recv(void * data, size_t size);
     // Post the trailing partial frame; must be called at every message boundary.
     bool flush();
+
+    // Zero-copy send. Register the region once, then send_from takes the payload out of
+    // it directly. Both return false when the provider cannot do it, and the caller
+    // falls back to send().
+    bool zc_register(void * addr, size_t size);
+    void zc_release();
+    bool send_from(const void * base, size_t off, size_t size);
     // True once the connection has failed; the caller should drop the socket.
     bool broken() const;
 

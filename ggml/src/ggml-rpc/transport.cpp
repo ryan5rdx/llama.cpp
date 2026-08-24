@@ -594,6 +594,41 @@ bool socket_t::impl::flush() {
     return true;
 }
 
+// Zero-copy send. Only the Apple RDMA transport implements it; everywhere else the
+// caller keeps using send_data.
+bool socket_t::zc_register(void * addr, size_t size) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->use_rdma) {
+        return pimpl->rdma->zc_register(addr, size);
+    }
+#else
+    GGML_UNUSED(addr);
+    GGML_UNUSED(size);
+#endif
+    return false;
+}
+
+void socket_t::zc_release() {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->use_rdma) {
+        pimpl->rdma->zc_release();
+    }
+#endif
+}
+
+bool socket_t::send_from(const void * base, size_t off, size_t size) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->use_rdma) {
+        return pimpl->rdma->send_from(base, off, size);
+    }
+#else
+    GGML_UNUSED(base);
+    GGML_UNUSED(off);
+    GGML_UNUSED(size);
+#endif
+    return false;
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 socket_t::socket_t(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
