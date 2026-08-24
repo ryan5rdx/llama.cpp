@@ -65,10 +65,11 @@ struct rpc_fence_api {
     bool   (*buffer_direct)(ggml_backend_buffer_t) = nullptr;
 };
 
+static bool rpc_fast_sync_requested() {
+    return RPC_FAST_SYNC != nullptr && atoi(RPC_FAST_SYNC) != 0;
+}
+
 static const rpc_fence_api * rpc_fence_get(ggml_backend_t backend) {
-    if (RPC_FAST_SYNC == nullptr || atoi(RPC_FAST_SYNC) == 0) {
-        return nullptr;
-    }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     if (reg == nullptr) {
         return nullptr;
@@ -1939,11 +1940,8 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     state.rank  = request.rank;
     state.world = request.world;
     state.fence_api = rpc_fence_get(backends[request.device]);
-    if (state.fence_api) {
+    if (state.fence_api && rpc_fast_sync_requested()) {
         state.fence = state.fence_api->init(backends[request.device]);
-        if (state.fence == nullptr) {
-            state.fence_api = nullptr;
-        }
     }
     GGML_LOG_INFO("[%s] device %u joined pairwise comm as rank %u, fast sync %s\n",
                   __func__, request.device, request.rank, state.fence ? "on" : "off");
@@ -2061,6 +2059,16 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     const int64_t t_synced = tick();
 
+    // A host-visible tensor can go on and off the wire in place, which skips the bounce
+    // through send_buf/recv_buf. Worth little on decode payloads but hundreds of
+    // microseconds per gate on prefill ones.
+    auto direct_addr = [&](const ggml_tensor * t) -> void * {
+        if (state.fence_api == nullptr || !state.fence_api->buffer_direct(t->buffer)) {
+            return nullptr;
+        }
+        return t->data;
+    };
+
     ggml_tensor * t_wire_send = nullptr;
     ggml_tensor * t_wire_recv = nullptr;
     if (wire_bf16) {
@@ -2068,9 +2076,14 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, ne*2);
         compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
         ggml_backend_synchronize(backend);
-        ggml_backend_tensor_get(t_wire_send, state.send_buf.data(), 0, wire_bytes);
-    } else {
-        ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
+    }
+    ggml_tensor * const t_send = wire_bf16 ? t_wire_send : t_dst;
+    ggml_tensor * const t_recv = wire_bf16 ? t_wire_recv : nullptr; // t_peer once it exists
+
+    const void * send_src = direct_addr(t_send);
+    if (send_src == nullptr) {
+        ggml_backend_tensor_get(t_send, state.send_buf.data(), 0, wire_bytes);
+        send_src = state.send_buf.data();
     }
 
     const int64_t t_packed = tick();
@@ -2109,13 +2122,19 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     }
 
     // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
+    void * recv_dst = direct_addr(t_recv ? t_recv : t_peer);
+    const bool recv_direct = recv_dst != nullptr;
+    if (!recv_direct) {
+        recv_dst = state.recv_buf.data();
+    }
+
     bool exch_ok;
     if (state.rank == 0) {
-        exch_ok = state.peer->send_data(state.send_buf.data(), wire_bytes) &&
-                  state.peer->recv_data(state.recv_buf.data(), wire_bytes);
+        exch_ok = state.peer->send_data(send_src, wire_bytes) &&
+                  state.peer->recv_data(recv_dst, wire_bytes);
     } else {
-        exch_ok = state.peer->recv_data(state.recv_buf.data(), wire_bytes) &&
-                  state.peer->send_data(state.send_buf.data(), wire_bytes);
+        exch_ok = state.peer->recv_data(recv_dst, wire_bytes) &&
+                  state.peer->send_data(send_src, wire_bytes);
     }
     if (!exch_ok) {
         // release anyway, so the queued reduce drains instead of spinning to the bound
@@ -2127,10 +2146,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     const int64_t t_exchanged = tick();
 
-    if (wire_bf16) {
-        ggml_backend_tensor_set(t_wire_recv, state.recv_buf.data(), 0, wire_bytes);
-    } else {
-        ggml_backend_tensor_set(t_peer, state.recv_buf.data(), 0, wire_bytes);
+    if (!recv_direct) {
+        ggml_backend_tensor_set(wire_bf16 ? t_wire_recv : t_peer, state.recv_buf.data(), 0, wire_bytes);
     }
 
     const int64_t t_unpacked = tick();
