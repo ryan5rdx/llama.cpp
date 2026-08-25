@@ -22,13 +22,15 @@
 #include <mutex>
 #include <optional>
 
+#ifndef _WIN32
+#  include <fcntl.h>
+#  include <poll.h>
+#endif
+
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
 #  include <array>
 #  include <time.h>
-#  ifndef _WIN32
-#    include <poll.h>
-#  endif
 #  ifdef GGML_RPC_RDMA_APPLE
 #    include "transport-apple.h"
 #  endif
@@ -680,13 +682,67 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 }
 
-socket_ptr socket_t::connect(const char * host, int port) {
+static void close_fd(sockfd_t fd) {
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+// Connect with the socket in non-blocking mode, then wait for writability. Returns false on
+// error or timeout; the caller closes the socket either way.
+static bool connect_within(sockfd_t fd, const struct sockaddr_in & addr, int timeout_ms) {
+#ifdef _WIN32
+    u_long nb = 1;
+    if (ioctlsocket(fd, FIONBIO, &nb) != 0) {
+        return false;
+    }
+#else
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return false;
+    }
+#endif
+    bool ok = false;
+    if (::connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        ok = true;
+    } else {
+#ifdef _WIN32
+        ok = WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        ok = errno == EINPROGRESS;
+#endif
+        if (ok) {
+            struct pollfd pfd = { fd, POLLOUT, 0 };
+#ifdef _WIN32
+            const int n = WSAPoll(&pfd, 1, timeout_ms);
+#else
+            const int n = poll(&pfd, 1, timeout_ms);
+#endif
+            // a connect failure reports writable too, so the pending error decides
+            int err = 0;
+            socklen_t len = sizeof(err);
+            ok = n == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len) == 0 && err == 0;
+        }
+    }
+#ifdef _WIN32
+    nb = 0;
+    ioctlsocket(fd, FIONBIO, &nb);
+#else
+    fcntl(fd, F_SETFL, flags);
+#endif
+    return ok;
+}
+
+socket_ptr socket_t::connect(const char * host, int port, int timeout_ms) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
     if (!set_no_delay(sockfd)) {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+        close_fd(sockfd);
         return nullptr;
     }
     struct sockaddr_in addr;
@@ -695,10 +751,15 @@ socket_ptr socket_t::connect(const char * host, int port) {
     struct hostent * server = gethostbyname(host);
     if (server == NULL) {
         GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
+        close_fd(sockfd);
         return nullptr;
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    const bool connected = timeout_ms > 0
+        ? connect_within(sockfd, addr, timeout_ms)
+        : ::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    if (!connected) {
+        close_fd(sockfd);
         return nullptr;
     }
     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));

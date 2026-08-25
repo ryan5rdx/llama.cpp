@@ -26,7 +26,9 @@ struct socket_t {
     void update_caps(const uint8_t * remote_caps);
 
     static socket_ptr create_server(const char * host, int port);
-    static socket_ptr connect(const char * host, int port);
+    // timeout_ms > 0 bounds the connect. An unreachable address otherwise blocks for the
+    // system SYN timeout, which is 75 s on macOS and long enough to look like a hang.
+    static socket_ptr connect(const char * host, int port, int timeout_ms = 0);
 
 private:
     struct impl;
