@@ -2198,6 +2198,12 @@ void rpc_server::comm_service(comm_state & state) {
             ok = false;
         }
 
+        // Whether this gate's release word arrives from the peer's NIC. Decided per gate
+        // rather than from state at the end: gate_arm() below turns the doorbell on part
+        // way through the gate that arms it, and that gate was exchanged over the byte
+        // stream, so its release still has to come from here.
+        bool nic_release = false;
+
         if (ok) {
             if (state.gate_armed && state.gate_size == g.wire_bytes) {
                 // exact-size, no header, straight into the slot the reduce will read
@@ -2210,6 +2216,9 @@ void rpc_server::comm_service(comm_state & state) {
                     // so the payload is always in place first.
                     *(uint32_t *) g.doorbell = g.seq;
                     ok = state.peer->gate_send(g.doorbell, sizeof(uint32_t));
+                    // the peer sends its own doorbell from the same branch, so once ours
+                    // is away the release for this gate is on its way from the far side
+                    nic_release = ok;
                 } else if (ok) {
                     ok = state.peer->gate_wait_recv(0, 30*1000*1000, ggml_time_us);
                 }
@@ -2259,7 +2268,7 @@ void rpc_server::comm_service(comm_state & state) {
         // every later gate is queued behind that, so not releasing wedges the whole
         // batch. When the doorbell is up the peer's NIC does this for us, and writing it
         // here as well would let the reduce run before the payload landed.
-        if (!state.gate_doorbell || !ok || g.wire_bytes != state.gate_size) {
+        if (!nic_release || !ok) {
             rpc_fence_store(&fw[RPC_FENCE_RELEASE], g.seq);
         }
 
