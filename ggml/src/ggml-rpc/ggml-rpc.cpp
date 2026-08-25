@@ -2563,7 +2563,6 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         submit_reduce();
     }
 
-    // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
     void * recv_dst = direct_addr(t_recv ? t_recv : t_peer);
     const bool recv_direct = recv_dst != nullptr;
     if (!recv_direct) {
@@ -2571,7 +2570,15 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     }
 
     bool exch_ok;
-    if (state.rank == 0) {
+    if (wire_bytes <= RPC_GATE_DUPLEX_MAX) {
+        // both directions in flight at once, as the service thread already does: the link
+        // is full duplex and the peer's pre-posted ring is deep enough that a payload this
+        // size cannot stall. Taking turns here costs a second one-way trip per gate.
+        exch_ok = state.peer->send_data(send_src, wire_bytes) &&
+                  state.peer->flush() &&
+                  state.peer->recv_data(recv_dst, wire_bytes);
+    } else if (state.rank == 0) {
+        // a big payload can outrun the ring, so the ranks take turns
         exch_ok = state.peer->send_data(send_src, wire_bytes) &&
                   state.peer->flush() &&
                   state.peer->recv_data(recv_dst, wire_bytes);
