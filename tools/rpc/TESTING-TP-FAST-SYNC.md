@@ -108,37 +108,98 @@ the comm port.
 
 ## 3. Launch
 
+Everything in this section was checked against two loopback servers on one machine, so
+the syntax is verified even though the RDMA path is not.
+
+### Restrict each server to its GPU
+
+By default a server exports **every** backend it has, so one node shows up as two RPC
+devices:
+
+```
+RPC0: 10.77.0.1:50052 (53084 MiB free)     <- Metal
+RPC1: 10.77.0.1:50052 (0 MiB free)         <- BLAS
+RPC2: 10.77.0.2:50052 (53084 MiB free)     <- Metal on the other node
+RPC3: 10.77.0.2:50052 (0 MiB free)
+```
+
+Node B's GPU is `RPC2`, not `RPC1`, and picking `RPC0` + `RPC1` gives you two devices on
+the *same* endpoint, which `comm_init` rejects outright.
+
+Pass `-d MTL0` so each node exports one device and the numbering is one per node:
+
 ```bash
 # node A
 ssh A 'cd llama.cpp && GGML_RPC_PROFILE=256 \
-  ./build-tp/bin/ggml-rpc-server -H 10.77.0.1 -p 50052 -c'
+  ./build-tp/bin/ggml-rpc-server -H 10.77.0.1 -p 50052 -d MTL0 -c'
 
 # node B
 ssh B 'cd llama.cpp && GGML_RPC_PROFILE=256 \
-  ./build-tp/bin/ggml-rpc-server -H 10.77.0.2 -p 50052 -c'
+  ./build-tp/bin/ggml-rpc-server -H 10.77.0.2 -p 50052 -d MTL0 -c'
 ```
 
-The comm port defaults to `port + 1000`, so `51052`. Override with `-C`.
+`-c` enables the tensor cache; without it the client re-uploads every weight on each run.
+The comm port defaults to `port + 1000`, so `51052`; override with `-C`.
 
-Client, on node A:
+### Confirm the device names
 
 ```bash
-./build-tp/bin/llama-bench --list-devices      # get the exact device names
+./build-tp/bin/llama-bench -rpc 10.77.0.1:50052,10.77.0.2:50052 --list-devices
+```
 
+`--rpc` must come **before** `--list-devices`, or no RPC devices are registered yet and
+you get only the local ones. Expect exactly:
+
+```
+RPC0: 10.77.0.1:50052 (...)
+RPC1: 10.77.0.2:50052 (...)
+```
+
+### Device names, and the separator trap
+
+The device name is plain `RPC0` / `RPC1`. **`RPC0[10.77.0.1:50052]` is not a device
+name** - that form is the buffer type, and passing it gives `invalid device`.
+
+The two tools take different separators, and getting it wrong is worse in one of them
+than the other:
+
+| tool | flag | correct | wrong |
+|---|---|---|---|
+| `llama-bench` | `-dev` | `RPC0/RPC1` | `RPC0,RPC1` |
+| `llama-cli` | `--device` | `RPC0,RPC1` | `RPC0/RPC1` |
+
+`llama-cli` rejects a slash with `invalid device`, so that one is self-correcting.
+**`llama-bench` accepts a comma silently** - it means "run these as separate combos", so
+you get two single-device benchmarks and no tensor parallelism at all, with a perfectly
+healthy-looking result. If a `-sm tensor` bench reports numbers that look like one node,
+check this first.
+
+### Benchmark
+
+```bash
 ./build-tp/bin/llama-bench -m /path/model.gguf \
   -rpc 10.77.0.1:50052,10.77.0.2:50052 \
   -sm tensor \
-  --device 'RPC0[10.77.0.1:50052],RPC1[10.77.0.2:50052]' \
+  -dev RPC0/RPC1 \
   -p 512 -n 128 -r 5
 ```
 
-Pin `--device`. Otherwise the client's own Metal device is enumerated alongside the two
-RPC ones and you get a three-way split, which `comm_init` rejects (`world != 2`).
+### Generate
+
+```bash
+./build-tp/bin/llama-cli -m /path/model.gguf \
+  --rpc 10.77.0.1:50052,10.77.0.2:50052 \
+  -sm tensor \
+  --device RPC0,RPC1 \
+  --temp 0 --seed 1 -n 256 -no-cnv -p "Write a haiku about Thunderbolt."
+```
+
+Pin the devices in both. Left to itself the client also enumerates its own Metal device
+and you get a three-way split, which `comm_init` rejects because it only implements
+`world == 2`.
 
 `-sm tensor` is refused for some architectures; see `llm_arch_supports_sm_tensor` in
 `src/llama-arch.cpp`.
-
----
 
 ## 4. Verify before trusting any measurement
 
@@ -259,8 +320,8 @@ releasing early:
 for arm in "" "GGML_RPC_METAL_FAST_SYNC=1" "GGML_RPC_METAL_FAST_SYNC=1 GGML_METAL_BATCH=1"; do
   # restart both servers with $arm, then:
   ./build-tp/bin/llama-cli -m /path/model.gguf \
-    -rpc 10.77.0.1:50052,10.77.0.2:50052 -sm tensor \
-    --device 'RPC0[...],RPC1[...]' \
+    --rpc 10.77.0.1:50052,10.77.0.2:50052 -sm tensor \
+    --device RPC0,RPC1 \
     --temp 0 --seed 1 -n 256 -no-cnv \
     -p "Write a haiku about Thunderbolt." > "out.$(echo $arm | md5).txt"
 done
