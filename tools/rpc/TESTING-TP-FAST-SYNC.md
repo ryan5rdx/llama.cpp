@@ -83,26 +83,44 @@ A model is only needed on the **client** node. The servers receive tensors over 
 
 ## 2. Addressing, which is where this goes wrong
 
-Apple Thunderbolt RDMA is point to point. Each cable is its own subnet, so a node's
-address depends on which cable you are asking about. Three consequences:
+A two-node run has **three** connections, and they do not all belong on the same network:
 
-**The client must run on A or B, not a third machine.** `ggml_backend_rpc_comm_init`
-derives rank 0's address by parsing the client's own `--rpc` string and ships it to
-rank 1. From a third machine that address is on the client-to-A cable, which B has no
-route to. It either fails to connect or, worse, silently reaches A over Ethernet and the
-peer link runs on TCP while the client links run on RDMA - a healthy-looking, meaningless
-benchmark.
+| link | carries | network |
+|---|---|---|
+| client -> A | weights, control plane | loopback on A |
+| client -> B | weights, control plane | Thunderbolt, or Ethernet if you have it |
+| A <-> B peer | allreduce gates | Thunderbolt, always |
 
-**`--rpc` must name A by its Thunderbolt address even though the client is on A.**
-Writing `127.0.0.1:50052` makes the client ship `127.0.0.1` to B, and B dials its own
-loopback. Same trap with A's Ethernet address: B would reach A over Ethernet and the peer
-link would be TCP.
+The peer link is the one under measurement. The other two exist to load the model and
+drive the graph.
 
-**`-H` decides where rank 0 listens for its peer.** `comm_init` binds the comm listener
-to whatever `-H` was given. Bind to `127.0.0.1` and the peer link never leaves loopback.
+**A local client cannot use the RDMA interface address.** Apple Thunderbolt RDMA is point
+to point and does not loop back: a connection whose two endpoints are the same interface
+has no queue-pair path. So the client, which runs on A, must reach A's server by some
+other address. Use `127.0.0.1`. TCP over that link is fine - it never carries gate
+traffic. The transport now detects a local-equals-peer connection and stays on TCP
+instead of probing the device, so getting this wrong degrades to TCP rather than failing
+to activate, but do not rely on it: name loopback explicitly.
+
+**Which means the peer address has to be configured separately.** Rank 0's peer-facing
+address used to be derived from the client's own `--rpc` string, which only works when
+every link shares one network. With the client on `127.0.0.1`, that would send B to dial
+its own loopback. Start each server with `--comm-host <its Thunderbolt address>`: the
+server advertises it in the HELLO response and the client passes that to rank 1, so the
+peer link lands on the cable regardless of how the client got there.
+
+Without `--comm-host` the old behaviour is unchanged - the peer dials whatever address the
+client used - which is still right when all three links share a network.
+
+**`-H` is only the client-facing listener.** It no longer has anything to do with the peer
+link once `--comm-host` is set. A can bind `-H 127.0.0.1` and still serve the peer on
+Thunderbolt.
 
 Order in `--rpc` matters: the first entry becomes rank 0 and is the side that listens on
-the comm port.
+the comm port. Set `--comm-host` on both nodes so the order can be swapped freely.
+
+**Do not run the client on a third machine.** Rank 0 still has to be reachable from rank 1
+on the fabric, and a third machine adds a second client cable with no route between them.
 
 ---
 
@@ -117,8 +135,8 @@ By default a server exports **every** backend it has, so one node shows up as tw
 devices:
 
 ```
-RPC0: 10.77.0.1:50052 (53084 MiB free)     <- Metal
-RPC1: 10.77.0.1:50052 (0 MiB free)         <- BLAS
+RPC0: 127.0.0.1:50052 (53084 MiB free)     <- Metal
+RPC1: 127.0.0.1:50052 (0 MiB free)         <- BLAS
 RPC2: 10.77.0.2:50052 (53084 MiB free)     <- Metal on the other node
 RPC3: 10.77.0.2:50052 (0 MiB free)
 ```
@@ -129,35 +147,51 @@ the *same* endpoint, which `comm_init` rejects outright.
 Pass `-d MTL0` so each node exports one device and the numbering is one per node:
 
 ```bash
-# node A
+# node A - client-facing listener on loopback, peer listener on the cable
 ssh A 'cd llama.cpp && GGML_RPC_PROFILE=256 \
-  ./build-tp/bin/ggml-rpc-server -H 10.77.0.1 -p 50052 -d MTL0 -c'
+  ./build-tp/bin/ggml-rpc-server -H 127.0.0.1 -p 50052 --comm-host 10.77.0.1 -d MTL0 -c'
 
-# node B
+# node B - must be reachable from the client on A
 ssh B 'cd llama.cpp && GGML_RPC_PROFILE=256 \
-  ./build-tp/bin/ggml-rpc-server -H 10.77.0.2 -p 50052 -d MTL0 -c'
+  ./build-tp/bin/ggml-rpc-server -H 10.77.0.2 -p 50052 --comm-host 10.77.0.2 -d MTL0 -c'
 ```
+
+Each prints the peer endpoint it will use, which is worth reading back before going
+further:
+
+```
+  endpoint       : 127.0.0.1:50052
+  comm endpoint  : 10.77.0.1:51052
+```
+
+A `comm endpoint` reading `<bind host>` means `--comm-host` did not take, and the peer
+link will follow the client's address instead of the cable.
 
 `-c` enables the tensor cache; without it the client re-uploads every weight on each run.
 The comm port defaults to `port + 1000`, so `51052`; override with `-C`.
 
+If A and B also share an Ethernet or Wi-Fi network, point the client at B over that
+instead of `10.77.0.2` and the Thunderbolt cable carries nothing but gate traffic. That
+is the cleanest arrangement to measure, since it removes weight upload and control-plane
+traffic from the link under test.
+
 ### Confirm the device names
 
 ```bash
-./build-tp/bin/llama-bench -rpc 10.77.0.1:50052,10.77.0.2:50052 --list-devices
+./build-tp/bin/llama-bench -rpc 127.0.0.1:50052,10.77.0.2:50052 --list-devices
 ```
 
 `--rpc` must come **before** `--list-devices`, or no RPC devices are registered yet and
 you get only the local ones. Expect exactly:
 
 ```
-RPC0: 10.77.0.1:50052 (...)
+RPC0: 127.0.0.1:50052 (...)
 RPC1: 10.77.0.2:50052 (...)
 ```
 
 ### Device names, and the separator trap
 
-The device name is plain `RPC0` / `RPC1`. **`RPC0[10.77.0.1:50052]` is not a device
+The device name is plain `RPC0` / `RPC1`. **`RPC0[127.0.0.1:50052]` is not a device
 name** - that form is the buffer type, and passing it gives `invalid device`.
 
 The two tools take different separators, and getting it wrong is worse in one of them
@@ -178,7 +212,7 @@ check this first.
 
 ```bash
 ./build-tp/bin/llama-bench -m /path/model.gguf \
-  -rpc 10.77.0.1:50052,10.77.0.2:50052 \
+  -rpc 127.0.0.1:50052,10.77.0.2:50052 \
   -sm tensor \
   -dev RPC0/RPC1 \
   -p 512 -n 128 -r 5
@@ -188,7 +222,7 @@ check this first.
 
 ```bash
 ./build-tp/bin/llama-cli -m /path/model.gguf \
-  --rpc 10.77.0.1:50052,10.77.0.2:50052 \
+  --rpc 127.0.0.1:50052,10.77.0.2:50052 \
   -sm tensor \
   --device RPC0,RPC1 \
   --temp 0 --seed 1 -n 256 -no-cnv -p "Write a haiku about Thunderbolt."
@@ -214,9 +248,21 @@ RDMA(Apple/UC) activated: qpn=...->... mtu=... rx_depth=...
 ```
 
 You want **two** activations on B - one for the client link, one for the peer link.
-Node A shows **one**: the client-to-A connection is A talking to its own Thunderbolt
-address, which does not establish a QP and falls back to loopback TCP. That asymmetry is
-expected.
+Node A shows **one**, for the peer link only: the client reaches A's server over
+loopback, which never probes the device. That asymmetry is expected. If you moved the
+client-to-B link onto Ethernet, B also drops to one.
+
+**The peer link is on the cable.** Run the client with `GGML_RPC_DEBUG=1` and `-v`. It
+logs what each server advertised and the address it hands to rank 1:
+
+```
+[negotiate_hello] server advertises comm endpoint 10.77.0.1:51052
+[ggml_backend_rpc_comm_init] rank 1 will dial rank 0 at 10.77.0.1:51052
+```
+
+A loopback or Ethernet address on that second line means `--comm-host` was not picked up
+and the gates are being measured over the wrong link. `<client-facing host>` on the first
+line means rank 0 was started without `--comm-host` at all.
 
 **The frame size negotiated down on the peer link.** The comm link asks for 16 KiB, so
 its probe line should read `ring=128 x 16 KiB`, while the client link stays
@@ -320,7 +366,7 @@ releasing early:
 for arm in "" "GGML_RPC_METAL_FAST_SYNC=1" "GGML_RPC_METAL_FAST_SYNC=1 GGML_METAL_BATCH=1"; do
   # restart both servers with $arm, then:
   ./build-tp/bin/llama-cli -m /path/model.gguf \
-    --rpc 10.77.0.1:50052,10.77.0.2:50052 -sm tensor \
+    --rpc 127.0.0.1:50052,10.77.0.2:50052 -sm tensor \
     --device RPC0,RPC1 \
     --temp 0 --seed 1 -n 256 -no-cnv \
     -p "Write a haiku about Thunderbolt." > "out.$(echo $arm | md5).txt"
@@ -366,6 +412,15 @@ partial that has already been overwritten. Wrong output with no error is the sig
 
 ## 7. Environment reference
 
+Server flags that decide the topology:
+
+| flag | default | meaning |
+|---|---|---|
+| `-H, --host` | `127.0.0.1` | address the client connects to |
+| `-p, --port` | `50052` | port the client connects to |
+| `--comm-host` | the `--host` address | address the peer server dials for gates |
+| `-C, --comm-port` | `port + 1000` | port the peer server dials for gates |
+
 | variable | side | default | meaning |
 |---|---|---|---|
 | `GGML_RPC_METAL_FAST_SYNC` | server | off | GPU-side fence instead of a blocking wait per gate |
@@ -387,7 +442,10 @@ do not set it for ordinary single-node Metal work.
 ## 8. What is unproven
 
 Validated on a single M1 Max, no network: the fence kernels, their ordering, the bounded
-timeout, and 122 inline fences in one command buffer driven by a service thread.
+timeout, and 122 inline fences in one command buffer driven by a service thread. Also
+checked against two loopback servers: the command syntax in section 3, the `--comm-host`
+advertisement in the HELLO response, and the transport declining to probe RDMA on a
+local-equals-peer connection.
 
 **Never executed anywhere:**
 
