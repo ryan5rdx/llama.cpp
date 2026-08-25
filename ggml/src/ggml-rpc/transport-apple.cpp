@@ -230,7 +230,7 @@ static uint8_t rdma_first_active_port(struct ibv_context * ctx, struct ibv_port_
 // peer, create a UC QP and register the frame rings. RDMA is point-to-point, so
 // the device is the one whose GID equals the bootstrap connection's local
 // address, i.e. the one cabled to the peer.
-std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid, uint8_t * caps) {
+std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid, uint8_t * caps, bool prefer_small_frames) {
     int ndev = 0;
     ibv_device ** devs = ibv_get_device_list(&ndev);
     if (!devs) return nullptr;
@@ -262,6 +262,7 @@ std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid
     c->port = port;
     c->gid_idx = gid_idx;
     c->path_mtu = pa.active_mtu;
+    c->stride_pref = prefer_small_frames ? RDMA_STRIDE_SMALL : RDMA_STRIDE_MAX;
 
     c->pd = ibv_alloc_pd(ctx);
     if (!c->pd) return nullptr;

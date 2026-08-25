@@ -135,6 +135,9 @@ struct socket_t::impl {
 
 #  ifdef GGML_RPC_RDMA_APPLE
     std::unique_ptr<apple_rdma> rdma;
+    // captured by prefer_small_frames() before probe runs, passed into probe so the
+    // advertised stride matches the negotiated one
+    bool small_frames = false;
 #  else
     bool rdma_probe();
     bool rdma_send(const void * data, size_t size);
@@ -570,7 +573,7 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
 #  ifdef GGML_RPC_RDMA_APPLE
     auto target_gid = rdma_build_target_gid();
     if (target_gid) {
-        rdma = apple_rdma::probe(fd, target_gid->data(), local_caps);
+        rdma = apple_rdma::probe(fd, target_gid->data(), local_caps, small_frames);
     }
 #  else
     rdma_local = {};
@@ -712,6 +715,9 @@ bool socket_t::gate_wait_recv(uint64_t tag, int64_t timeout_us, int64_t (*now_us
 // transport pads to a fixed frame, so it is a no-op elsewhere.
 void socket_t::prefer_small_frames() {
 #ifdef GGML_RPC_RDMA_APPLE
+    // may be called before the device is open (before probe), so record it on the
+    // socket and let get_caps hand it to probe; also apply directly if already open
+    pimpl->small_frames = true;
     if (pimpl->rdma) {
         pimpl->rdma->prefer_small_frames();
     }

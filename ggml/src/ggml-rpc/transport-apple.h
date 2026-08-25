@@ -5,8 +5,10 @@
 #include <memory>
 
 struct apple_rdma {
-    // target_gid is 16 bytes in, caps is RPC_CONN_CAPS_SIZE bytes out.
-    static std::unique_ptr<apple_rdma> probe(int fd, const uint8_t * target_gid, uint8_t * caps);
+    // target_gid is 16 bytes in, caps is RPC_CONN_CAPS_SIZE bytes out. prefer_small_frames
+    // is captured before probe runs (the caller may request it before any device is open)
+    // and is baked into the caps so the advertised stride matches what the link will use.
+    static std::unique_ptr<apple_rdma> probe(int fd, const uint8_t * target_gid, uint8_t * caps, bool prefer_small_frames);
     ~apple_rdma();
 
     // Peer endpoint from its caps, which must be non-zero: this blocks on a
