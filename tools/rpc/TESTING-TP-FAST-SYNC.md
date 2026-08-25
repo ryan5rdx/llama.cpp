@@ -3,10 +3,10 @@
 How to exercise `-sm tensor` across two Apple silicon Macs joined by a Thunderbolt cable,
 on branch `apple-rdma-tp-fast-sync`.
 
-The RDMA baseline now runs on real hardware. The fast-sync path has had exactly one run,
-which hung on a bug that is since fixed; nothing past it has been exercised. Read
-[Status](#status) for where things stand and [What is unproven](#what-is-unproven) before
-trusting a number.
+The RDMA baseline now runs on real hardware. The fast-sync path has hung on both of its
+two runs, on two different bugs, each since fixed; nothing past the second gate has ever
+been exercised. Read [Status](#status) for where things stand and
+[What is unproven](#what-is-unproven) before trusting a number.
 
 Throughout, `A` and `B` are the two nodes, `$TB_A` and `$TB_B` their Thunderbolt
 addresses.
@@ -46,7 +46,7 @@ Arm 2 has none of this branch's changes active. It is the "before" number and no
 comparison point against ds4, which runs one command buffer per token with in-shader
 fences and never returns to the host mid-token.
 
-### Arm 3, fast sync - hung, fixed, not yet re-run
+### Arm 3, fast sync - hung twice, two bugs fixed, not yet re-run
 
 Both ranks armed cleanly (`fast sync on`, fence enabled, gate channel up), then rank 1
 logged `[comm_service] gate 2 never arrived` and both stalled until killed.
@@ -61,6 +61,36 @@ gate 1 is the one that broke.
 
 Fixed by deciding per gate whether a doorbell was actually sent, rather than re-reading
 mutable state after the exchange.
+
+**Second run: still hung**, and the fence dump named a different fault:
+
+```
+gate 2 never arrived: arrival=86 release=1 timeout=1 sink=1058455319,
+queued=86 done=1, 4194304 byte bf16 payload, channel off doorbell off
+```
+
+`timeout=1` is the one that matters. The stalled gate is a 4 MiB **prefill** payload, not
+a decode one. Its exchange takes milliseconds on the wire, longer than the wait kernel's
+8M-iteration bound, so the spin gave up and set the timeout word. Every later wait kernel
+returns on its first instruction once that word is set, so the GPU ran the whole encoded
+queue out in one go and `arrival` jumped to 86 while the service thread was still on gate
+2. The producer is not free-running: it cannot pass a wait kernel without a release or a
+timeout, and it only got ahead because the fence had already failed.
+
+Two fixes:
+
+- **The arrival wait compares `<`, not `!=`.** Arrival can legitimately be ahead of the
+  gate being serviced. An equality test spins to the 30 s deadline and reports the wrong
+  gate; `<` falls through to the timeout check, which names the real fault and fails the
+  connection loudly instead of hanging.
+- **Gates above `RPC_FENCE_MAX_PAYLOAD` (1 MiB) take the blocking path.** The fence spins
+  the GPU for the whole exchange, so it only pays where the exchange is short. On a
+  prefill gate it burns the GPU for milliseconds to remove a host block that is amortized
+  over the entire chunk, and risks the spin bound while doing it. Decode gates are 16 KiB
+  and exchange in ~46 us, three orders of magnitude inside the bound.
+
+Mixing the two paths in one session means the service thread and the request thread both
+use the peer socket, so the blocking path now drains any queued gate before touching it.
 
 ### The target, and where the gap is
 

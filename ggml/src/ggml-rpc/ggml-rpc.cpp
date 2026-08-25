@@ -64,6 +64,13 @@ enum { RPC_FENCE_ARRIVAL = 0, RPC_FENCE_RELEASE = 1, RPC_FENCE_TIMEOUT = 2, RPC_
 // link. Above it they take turns, so a payload cannot outrun the peer's pre-posted ring.
 static constexpr size_t RPC_GATE_DUPLEX_MAX = 1024 * 1024;
 
+// The fence spins the GPU for the whole exchange, so it only pays where the exchange is
+// short. A prefill payload is megabytes and takes milliseconds on the wire: long enough to
+// exhaust the spin bound, which sets the timeout word and disables every later fence in
+// the session. Spinning the GPU that long buys nothing anyway, since the host block the
+// fence removes is amortised over the whole chunk. Larger gates take the blocking path.
+static constexpr size_t RPC_FENCE_MAX_PAYLOAD = RPC_GATE_DUPLEX_MAX;
+
 struct rpc_fence_api {
     void * (*init)   (ggml_backend_t)            = nullptr;
     void   (*destroy)(void *)                    = nullptr;
@@ -2181,7 +2188,13 @@ void rpc_server::comm_service(comm_state & state) {
         if (ok) {
             // the publish runs after the partial, so observing it means the data is there
             const int64_t deadline = ggml_time_us() + 30*1000*1000;
-            while (rpc_fence_load(&fw[RPC_FENCE_ARRIVAL]) != g.seq) {
+            // Strictly less than, never unequal: the arrival word can be *ahead* of this
+            // gate. A wait kernel that hits its iteration bound sets the timeout word, and
+            // every later one then returns on its first instruction, so the GPU runs the
+            // rest of the queue out in one go and arrival jumps to the last gate encoded.
+            // An equality test spins to the deadline on that and reports the wrong gate;
+            // this way the timeout check below sees it and names the real fault.
+            while (rpc_fence_load(&fw[RPC_FENCE_ARRIVAL]) < g.seq) {
                 if (ggml_time_us() > deadline || state.service_stop) {
                     // Dump the fence words: which of them moved says where this stopped.
                     // arrival == seq-1 with release == seq-1 means the GPU published the
@@ -2443,7 +2456,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     // the fenced path writes the peer partial into the scratch while the reduce is
     // already queued, so that write must not be a blit queued behind it
-    void * const fence = (state.fence && state.fence_api.buffer_direct(state.scratch.get()))
+    void * const fence = (state.fence && state.fence_api.buffer_direct(state.scratch.get())
+                          && wire_bytes <= RPC_FENCE_MAX_PAYLOAD)
         ? state.fence : nullptr;
 
     // A host-visible tensor can go on and off the wire in place, which skips the bounce
@@ -2536,6 +2550,14 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
                 wire_bf16 ? "bf16" : "f32");
 
         return true;
+    }
+
+    // Below here the gate is exchanged on this thread. The service thread uses the same
+    // socket, so any gate still queued has to finish first: a session mixes the two paths
+    // whenever it has both prefill and decode gates.
+    if (state.fence && !comm_drain(state)) {
+        GGML_LOG_ERROR("[%s] a queued gate failed before this one\n", __func__);
+        return false;
     }
 
     volatile uint32_t * const fw  = fence ? state.fence_api.words(fence) : nullptr;
