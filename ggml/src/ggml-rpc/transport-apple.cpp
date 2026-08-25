@@ -44,9 +44,6 @@ static_assert(RDMA_STRIDE_SMALL % RDMA_FRAME == 0, "RDMA_STRIDE_SMALL must be a 
 // TN3205 counts queue depth in Thunderbolt frames, not work requests.
 static constexpr uint32_t RDMA_QP_WR       = (uint32_t)(RDMA_RING_BYTES / RDMA_FRAME);
 static constexpr uint64_t RDMA_RECV_WR     = 1ull << 20;  // wr_id bit tagging recv completions
-// A send straight out of caller memory still has to fill a whole stride, so it goes as
-// header + payload + padding. Two extra scatter entries on top of the payload.
-static constexpr uint32_t RDMA_ZC_SGE      = 3;
 static constexpr uint64_t RDMA_WR_IDX_MASK = 0xffff;      // buffer index in the low bits of wr_id
 static constexpr uint8_t  RDMA_SYNC_READY  = 0x2A;        // readiness-handshake byte (peer activated)
 
@@ -93,10 +90,6 @@ struct apple_rdma::impl {
     uint32_t pend_len = 0;
     bool     broken = false;
 
-    // caller memory registered for sending without a bounce copy, keyed by base address
-    std::unordered_map<const void *, struct ibv_mr *> zc_mrs;
-    uint32_t     max_sge = 1;
-
     uint32_t     qpn = 0;
     uint8_t      port = 0;
     int          gid_idx = 0;
@@ -116,33 +109,6 @@ struct apple_rdma::impl {
         wr.sg_list = &sge;
         wr.num_sge = 1;
         return ibv_post_recv(qp, &wr, &bad) == 0;
-    }
-
-    // Send the whole stride, but take the payload straight from registered caller memory
-    // instead of copying it in first. The receive side is unchanged.
-    bool post_send_zc(int i, const void * src, size_t len, struct ibv_mr * mr) {
-        uint8_t * hdr = send_mem + (size_t)i * stride;
-        ((rdma_seg_hdr *)hdr)->magic = RDMA_SEG_MAGIC;
-        ((rdma_seg_hdr *)hdr)->len   = (uint32_t)len;
-
-        struct ibv_sge sge[RDMA_ZC_SGE] = {};
-        sge[0].addr   = (uintptr_t)hdr;
-        sge[0].length = (uint32_t)sizeof(rdma_seg_hdr);
-        sge[0].lkey   = send_mr->lkey;
-        sge[1].addr   = (uintptr_t)src;
-        sge[1].length = (uint32_t)len;
-        sge[1].lkey   = mr->lkey;
-        sge[2].addr   = (uintptr_t)(hdr + sizeof(rdma_seg_hdr));
-        sge[2].length = (uint32_t)(payload - len);
-        sge[2].lkey   = send_mr->lkey;
-
-        struct ibv_send_wr wr = {}, * bad = nullptr;
-        wr.wr_id      = (uint64_t)i;
-        wr.sg_list    = sge;
-        wr.num_sge    = sge[2].length ? 3 : 2;
-        wr.opcode     = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        return ibv_post_send(qp, &wr, &bad) == 0;
     }
 
     bool post_send(int i, size_t len) {
@@ -280,11 +246,10 @@ std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid
     qia.qp_type = IBV_QPT_UC;
     qia.cap.max_send_wr  = RDMA_QP_WR;
     qia.cap.max_recv_wr  = RDMA_QP_WR;
-    qia.cap.max_send_sge = RDMA_ZC_SGE; // falls back to a bounce copy if not granted
+    qia.cap.max_send_sge = 1;  // all the provider grants; every WR here uses one
     qia.cap.max_recv_sge = 1;
     c->qp = ibv_create_qp(c->pd, &qia);
     if (!c->qp) return nullptr;
-    c->max_sge = qia.cap.max_send_sge;
 
     {
         ibv_qp_attr a = {};
@@ -533,56 +498,7 @@ bool apple_rdma::flush() {
     return pimpl->post_pending();
 }
 
-// Register caller memory so send_from can take the payload out of it directly. Returns
-// false when the provider will not do it, and the caller keeps using send().
 void apple_rdma::prefer_small_frames() {
     pimpl->stride_pref = RDMA_STRIDE_SMALL;
 }
 
-bool apple_rdma::zc_register(void * addr, size_t size) {
-    impl * c = pimpl.get();
-    if (c->broken || c->max_sge < RDMA_ZC_SGE) {
-        return false;
-    }
-    if (c->zc_mrs.count(addr)) {
-        return true;
-    }
-    struct ibv_mr * mr = ibv_reg_mr(c->pd, addr, size, IBV_ACCESS_LOCAL_WRITE);
-    if (!mr) {
-        GGML_LOG_WARN("RDMA(Apple/UC) cannot register caller memory, using a bounce copy\n");
-        return false;
-    }
-    c->zc_mrs[addr] = mr;
-    return true;
-}
-
-void apple_rdma::zc_release() {
-    impl * c = pimpl.get();
-    for (auto & kv : c->zc_mrs) {
-        ibv_dereg_mr(kv.second);
-    }
-    c->zc_mrs.clear();
-}
-
-bool apple_rdma::send_from(const void * base, size_t off, size_t size) {
-    impl * c = pimpl.get();
-    if (c->broken) {
-        return false;
-    }
-    auto it = c->zc_mrs.find(base);
-    if (it == c->zc_mrs.end() || size > c->payload || c->pend_len != 0) {
-        return false; // not registered, too big for one stride, or mid-coalesce
-    }
-    if (!c->acquire_pending()) {
-        return false;
-    }
-    const int i = c->pend_buf;
-    c->pend_buf = -1;
-    c->pend_len = 0;
-    if (!c->post_send_zc(i, (const uint8_t *) base + off, size, it->second)) {
-        c->broken = true;
-        return false;
-    }
-    c->send_busy[i] = 1;
-    return true;
-}
