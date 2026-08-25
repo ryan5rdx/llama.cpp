@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    6
+#define RPC_PROTO_MAJOR_VERSION    7
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
@@ -24,9 +24,12 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const c
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
+// comm_host: address peer servers dial for server-to-server collectives. NULL or "" reuses
+// the endpoint's bind address, which is right when one address reaches this server from
+// everywhere. Set it when the peer link runs over a different network than the client link.
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
-                                                    uint16_t comm_port);
+                                                    const char * comm_host, uint16_t comm_port);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);

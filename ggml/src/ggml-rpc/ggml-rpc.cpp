@@ -103,6 +103,10 @@ struct rpc_msg_hello_rsp {
     // port this server uses for direct server-to-server communication (collectives)
     uint16_t comm_port;
     uint8_t  conn_caps[RPC_CONN_CAPS_SIZE];
+    // address a peer server dials to reach comm_port, when that differs from the address
+    // the client used. Empty means "the same host the client connected to", which is right
+    // whenever one address reaches a server from everywhere.
+    char     comm_host[64];
 };
 
 struct rpc_msg_device_count_rsp {
@@ -382,7 +386,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint16_t * comm_port = nullptr) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint16_t * comm_port = nullptr,
+                            std::string * comm_host = nullptr) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -400,18 +405,29 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint16_t * c
     if (comm_port != nullptr) {
         *comm_port = response.comm_port;
     }
+    if (comm_host != nullptr) {
+        comm_host->assign(response.comm_host, strnlen(response.comm_host, sizeof(response.comm_host)));
+        LOG_DBG("[%s] server advertises comm endpoint %s:%u\n", __func__,
+                comm_host->empty() ? "<client-facing host>" : comm_host->c_str(), response.comm_port);
+    }
     sock->update_caps(response.conn_caps);
     return true;
 }
 
-// comm port advertised by each server in its HELLO response, used for server-to-server collectives
-static std::mutex server_comm_port_mutex;
-static std::unordered_map<std::string, uint16_t> server_comm_ports;
+// Peer-facing endpoint advertised by each server in its HELLO response, used to set up
+// server-to-server collectives.
+struct rpc_server_comm_addr {
+    std::string host;   // empty: not overridden, fall back to the address the client used
+    uint16_t    port = 0;
+};
 
-static uint16_t rpc_server_comm_port(const std::string & endpoint) {
-    std::lock_guard<std::mutex> lock(server_comm_port_mutex);
-    auto it = server_comm_ports.find(endpoint);
-    return it != server_comm_ports.end() ? it->second : 0;
+static std::mutex server_comm_addr_mutex;
+static std::unordered_map<std::string, rpc_server_comm_addr> server_comm_addrs;
+
+static rpc_server_comm_addr rpc_server_comm_address(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(server_comm_addr_mutex);
+    auto it = server_comm_addrs.find(endpoint);
+    return it != server_comm_addrs.end() ? it->second : rpc_server_comm_addr{};
 }
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
@@ -439,13 +455,13 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    uint16_t comm_port = 0;
-    if (!negotiate_hello(sock, &comm_port)) {
+    rpc_server_comm_addr comm_addr;
+    if (!negotiate_hello(sock, &comm_addr.port, &comm_addr.host)) {
         return nullptr;
     }
     {
-        std::lock_guard<std::mutex> comm_port_lock(server_comm_port_mutex);
-        server_comm_ports[endpoint] = comm_port;
+        std::lock_guard<std::mutex> comm_addr_lock(server_comm_addr_mutex);
+        server_comm_addrs[endpoint] = comm_addr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     sockets[endpoint] = sock;
@@ -973,9 +989,9 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir,
-               std::string comm_host, uint16_t comm_port)
+               std::string bind_host, std::string comm_host, uint16_t comm_port)
         : backends(std::move(all_backends)), cache_dir(cache_dir),
-          comm_host(std::move(comm_host)), comm_port(comm_port) {
+          bind_host(std::move(bind_host)), comm_host(std::move(comm_host)), comm_port(comm_port) {
         stored_graphs.resize(backends.size());
         comm_states.resize(backends.size());
     }
@@ -1032,7 +1048,10 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
-    // host and port this server binds for direct server-to-server communication (collectives)
+    // Where this server accepts the peer connection for collectives. bind_host is the
+    // client-facing address, used when comm_host is empty; comm_host is the explicit
+    // peer-facing address from --comm-host, which is also what gets advertised in HELLO.
+    std::string bind_host;
     std::string comm_host;
     uint16_t    comm_port;
     std::unordered_set<ggml_backend_buffer_t> buffers;
@@ -1046,6 +1065,12 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.minor     = RPC_PROTO_MINOR_VERSION;
     response.patch     = RPC_PROTO_PATCH_VERSION;
     response.comm_port = comm_port;
+    // Advertise a peer-facing address only when one was configured. Left empty, the client
+    // falls back to the address it used itself, which is right when one address reaches this
+    // server from everywhere and wrong when it does not.
+    if (!comm_host.empty() && comm_host.size() < sizeof(response.comm_host)) {
+        memcpy(response.comm_host, comm_host.c_str(), comm_host.size());
+    }
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -1793,10 +1818,13 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     uint8_t local_caps[RPC_CONN_CAPS_SIZE] = {};
     uint8_t remote_caps[RPC_CONN_CAPS_SIZE] = {};
     if (request.rank == 0) {
-        // listen on the same host the server was bound to, on the configured comm port
-        socket_ptr srv = socket_t::create_server(comm_host.c_str(), comm_port);
+        // listen on the peer-facing address if one was configured, otherwise on the same
+        // host the client-facing listener was bound to
+        const std::string & listen_host = comm_host.empty() ? bind_host : comm_host;
+        socket_ptr srv = socket_t::create_server(listen_host.c_str(), comm_port);
         if (srv == nullptr) {
-            GGML_LOG_ERROR("[%s] failed to listen on comm port %u\n", __func__, comm_port);
+            GGML_LOG_ERROR("[%s] failed to listen for the peer on %s:%u\n", __func__,
+                           listen_host.c_str(), comm_port);
             return true;
         }
         state.peer = srv->accept();
@@ -1815,15 +1843,20 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         state.peer->update_caps(remote_caps);
     } else {
         const std::string host(request.host, strnlen(request.host, sizeof(request.host)));
-        // rank 0 may not be listening yet, retry for a few seconds
-        for (int i = 0; i < 100 && state.peer == nullptr; i++) {
-            state.peer = socket_t::connect(host.c_str(), request.port);
+        // Rank 0 may not be listening yet, so retry - but bound both the individual connect
+        // and the total. An unreachable peer address is an ordinary misconfiguration here,
+        // and an unbounded connect blocks this thread for the system SYN timeout (75 s on
+        // macOS) per attempt, during which the server accepts no clients at all.
+        const int64_t deadline = ggml_time_us() + 10*1000*1000;
+        do {
+            state.peer = socket_t::connect(host.c_str(), request.port, /*timeout_ms =*/ 1000);
             if (state.peer == nullptr) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-        }
+        } while (state.peer == nullptr && ggml_time_us() < deadline);
         if (state.peer == nullptr) {
-            GGML_LOG_ERROR("[%s] failed to connect to peer %s:%u\n", __func__, host.c_str(), request.port);
+            GGML_LOG_ERROR("[%s] failed to connect to peer %s:%u, falling back to the "
+                           "client-routed allreduce\n", __func__, host.c_str(), request.port);
             return true;
         }
         state.peer->get_caps(local_caps);
@@ -1991,8 +2024,9 @@ rpc_server::~rpc_server() {
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             const std::string & comm_host, uint16_t comm_port, socket_ptr sock) {
-    rpc_server server(backends, cache_dir, comm_host, comm_port);
+                             const std::string & bind_host, const std::string & comm_host,
+                             uint16_t comm_port, socket_ptr sock) {
+    rpc_server server(backends, cache_dir, bind_host, comm_host, comm_port);
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2330,7 +2364,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
-                                   uint16_t comm_port) {
+                                   const char * comm_host, uint16_t comm_port) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
@@ -2340,8 +2374,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_MAJOR_VERSION,
         RPC_PROTO_MINOR_VERSION,
         RPC_PROTO_PATCH_VERSION);
+    const std::string comm_host_str = comm_host ? comm_host : "";
     printf("  endpoint       : %s\n", endpoint);
-    printf("  comm port      : %u\n", comm_port);
+    printf("  comm endpoint  : %s:%u%s\n",
+           comm_host_str.empty() ? "<bind host>" : comm_host_str.c_str(), comm_port,
+           comm_host_str.empty() ? " (peers dial the address the client used)" : "");
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
@@ -2393,7 +2430,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, host, comm_port, client_socket);
+        rpc_serve_client(backends, cache_dir, host, comm_host_str, comm_port, client_socket);
         printf("Client connection closed\n");
         fflush(stdout);
     }
@@ -2571,22 +2608,30 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         ranks.push_back({rpc_ctx->endpoint, rpc_ctx->device});
     }
 
-    // rank 1 connects to rank 0's serving host on the comm port advertised in rank 0's HELLO
-    // response; the servers must be reachable from each other (binding to 127.0.0.1 is fine
-    // as long as all servers run on the same machine)
-    std::string host0;
-    int port0;
-    if (!parse_endpoint(ranks[0].endpoint, host0, port0)) {
-        return nullptr;
-    }
-    const uint16_t comm_port = rpc_server_comm_port(ranks[0].endpoint);
+    // Rank 1 dials rank 0 on the endpoint rank 0 advertised in its HELLO response. A server
+    // started with --comm-host advertises that address, which lets the peer link run over a
+    // different network than the client link. That is required where no single address
+    // reaches a server from everywhere: Apple RDMA over Thunderbolt is point to point, so a
+    // server's address on the cable to its peer is not the one the client uses.
+    // Otherwise fall back to the address the client itself used, which is right whenever
+    // every link shares one routable network.
+    const rpc_server_comm_addr comm_addr = rpc_server_comm_address(ranks[0].endpoint);
+    const uint16_t comm_port = comm_addr.port;
     if (comm_port == 0) {
         GGML_LOG_WARN("%s: server %s does not advertise a comm port\n", __func__, ranks[0].endpoint.c_str());
         return nullptr;
     }
+    std::string host0 = comm_addr.host;
+    if (host0.empty()) {
+        int port0;
+        if (!parse_endpoint(ranks[0].endpoint, host0, port0)) {
+            return nullptr;
+        }
+    }
     if (host0.size() >= 64) {
         return nullptr;
     }
+    LOG_DBG("[%s] rank 1 will dial rank 0 at %s:%u\n", __func__, host0.c_str(), comm_port);
 
     // Send all init requests before reading any response: rank 0 blocks in accept
     // until rank 1 has connected.
