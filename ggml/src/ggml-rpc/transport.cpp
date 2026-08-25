@@ -194,6 +194,34 @@ std::optional<rdma_gid_t> socket_t::impl::rdma_build_target_gid() {
     return std::nullopt;
 }
 
+// A connection whose local and peer addresses are the same has no working queue-pair path:
+// the fabric cannot loop a message back to the interface that sent it. Apple RDMA over
+// Thunderbolt is the case that matters here, where a client sharing a host with a server
+// would otherwise probe the RDMA device, advertise caps, and then fail to activate. Such a
+// connection stays on TCP, which carries it perfectly well.
+static bool socket_is_self_connection(sockfd_t fd) {
+    sockaddr_storage local = {};
+    sockaddr_storage peer  = {};
+    socklen_t local_len = sizeof(local);
+    socklen_t peer_len  = sizeof(peer);
+    if (getsockname(fd, reinterpret_cast<sockaddr *>(&local), &local_len) != 0 ||
+        getpeername(fd, reinterpret_cast<sockaddr *>(&peer),  &peer_len)  != 0 ||
+        local.ss_family != peer.ss_family) {
+        return false;
+    }
+    if (local.ss_family == AF_INET) {
+        const auto * l = reinterpret_cast<const sockaddr_in *>(&local);
+        const auto * p = reinterpret_cast<const sockaddr_in *>(&peer);
+        return memcmp(&l->sin_addr, &p->sin_addr, sizeof(l->sin_addr)) == 0;
+    }
+    if (local.ss_family == AF_INET6) {
+        const auto * l = reinterpret_cast<const sockaddr_in6 *>(&local);
+        const auto * p = reinterpret_cast<const sockaddr_in6 *>(&peer);
+        return memcmp(&l->sin6_addr, &p->sin6_addr, sizeof(l->sin6_addr)) == 0;
+    }
+    return false;
+}
+
 #ifndef GGML_RPC_RDMA_APPLE
 
 bool socket_t::impl::tcp_peer_closed() {
@@ -533,6 +561,10 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
     memset(local_caps, 0, RPC_CONN_CAPS_SIZE);
 #ifdef GGML_RPC_RDMA
     if (std::getenv("GGML_RPC_NO_RDMA")) {
+        return;
+    }
+    if (socket_is_self_connection(fd)) {
+        LOG_DBG("[%s] local and peer addresses match, staying on TCP\n", __func__);
         return;
     }
 #  ifdef GGML_RPC_RDMA_APPLE
