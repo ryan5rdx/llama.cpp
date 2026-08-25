@@ -58,7 +58,7 @@ static int64_t         g_gate_prof_total  = 0;
 // backend may not provide a fence, in which case the gate keeps its original shape.
 static const char * RPC_FAST_SYNC = std::getenv("GGML_RPC_METAL_FAST_SYNC");
 
-enum { RPC_FENCE_ARRIVAL = 0, RPC_FENCE_RELEASE = 1, RPC_FENCE_TIMEOUT = 2 };
+enum { RPC_FENCE_ARRIVAL = 0, RPC_FENCE_RELEASE = 1, RPC_FENCE_TIMEOUT = 2, RPC_FENCE_SINK = 3 };
 
 // Below this both ranks send before receiving, which halves gate latency on a full duplex
 // link. Above it they take turns, so a payload cannot outrun the peer's pre-posted ring.
@@ -2183,7 +2183,29 @@ void rpc_server::comm_service(comm_state & state) {
             const int64_t deadline = ggml_time_us() + 30*1000*1000;
             while (rpc_fence_load(&fw[RPC_FENCE_ARRIVAL]) != g.seq) {
                 if (ggml_time_us() > deadline || state.service_stop) {
-                    GGML_LOG_ERROR("[%s] gate %u never arrived\n", __func__, g.seq);
+                    // Dump the fence words: which of them moved says where this stopped.
+                    // arrival == seq-1 with release == seq-1 means the GPU published the
+                    // previous gate and is sitting in its wait kernel even though the
+                    // release word it spins on already holds the value - a visibility
+                    // problem, not a missing write. timeout != 0 means the spin gave up.
+                    // arrival behind that means the command buffer never ran at all.
+                    size_t queued = 0, done = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(state.mtx);
+                        queued = state.gates_queued;
+                        done   = state.gates_done;
+                    }
+                    GGML_LOG_ERROR("[%s] gate %u never arrived: arrival=%u release=%u timeout=%u "
+                                   "sink=%u, queued=%zu done=%zu, %zu byte %s payload, "
+                                   "channel %s doorbell %s\n",
+                                   __func__, g.seq,
+                                   rpc_fence_load(&fw[RPC_FENCE_ARRIVAL]),
+                                   rpc_fence_load(&fw[RPC_FENCE_RELEASE]),
+                                   rpc_fence_load(&fw[RPC_FENCE_TIMEOUT]),
+                                   rpc_fence_load(&fw[RPC_FENCE_SINK]),
+                                   queued, done, g.wire_bytes, g.wire_bf16 ? "bf16" : "f32",
+                                   state.gate_armed ? "armed" : "off",
+                                   state.gate_doorbell ? "on" : "off");
                     ok = false;
                     break;
                 }
@@ -2290,6 +2312,10 @@ void rpc_server::comm_service(comm_state & state) {
                 rpc_gate_prof_report();
             }
         }
+
+        LOG_DBG("[%s] gate %u %s (arrival=%u release=%u timeout=%u)\n", __func__, g.seq,
+                ok ? "done" : "FAILED", rpc_fence_load(&fw[RPC_FENCE_ARRIVAL]),
+                rpc_fence_load(&fw[RPC_FENCE_RELEASE]), rpc_fence_load(&fw[RPC_FENCE_TIMEOUT]));
 
         {
             std::lock_guard<std::mutex> lock(state.mtx);
@@ -2506,6 +2532,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
             state.gates_queued++;
         }
         state.cv.notify_all();
+        LOG_DBG("[%s] queued gate %u, %zu bytes %s\n", __func__, seq, wire_bytes,
+                wire_bf16 ? "bf16" : "f32");
 
         return true;
     }
