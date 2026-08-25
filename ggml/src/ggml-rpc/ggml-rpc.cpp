@@ -108,12 +108,25 @@ static inline void rpc_fence_store(volatile uint32_t * w, uint32_t v) {
 
 // One queued gate. The ggml context that produced the tensors is gone by the time the
 // service thread runs, so this carries raw host addresses only.
+// The peer may run ahead, so the region its NIC writes into rotates: gate i lands in
+// slot i mod RPC_GATE_SLOTS. Without that, gate i+1 could overwrite the partial the GPU
+// is still reducing for gate i - the fence orders our own GPU, not the peer's NIC.
+static constexpr uint32_t RPC_GATE_SLOTS = 4;
+
 struct rpc_gate {
     uint32_t seq;
     const void * send_src;
     void *       recv_dst;
     size_t       wire_bytes;
     bool         wire_bf16;
+
+    // what the gate channel needs to register memory and pre-post the next receives
+    void *       recv_base    = nullptr;   // slot 0
+    size_t       recv_stride  = 0;
+    void *       scratch_base = nullptr;
+    size_t       scratch_size = 0;
+    const void * send_base    = nullptr;
+    size_t       send_size    = 0;
 };
 
 // Bounded so a dead peer cannot leave the command processor spinning until the GPU
@@ -1160,6 +1173,11 @@ private:
         std::mutex              mtx;
         std::condition_variable cv;
         std::deque<rpc_gate>    queue;
+
+        // gate channel state, touched only by the service thread
+        bool                    gate_armed = false;
+        bool                    gate_tried = false;
+        size_t                  gate_size  = 0;
         std::atomic<bool>       service_stop{false};
         bool                    service_failed = false;
         uint32_t                gates_done     = 0;
@@ -1182,6 +1200,7 @@ private:
 
     void comm_service(comm_state & state);
     bool comm_drain  (comm_state & state);
+    void gate_arm    (comm_state & state, const rpc_gate & g);
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
@@ -1998,6 +2017,19 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         }
         state.peer->update_caps(remote_caps);
     }
+    // Gate channel: a second queue pair carrying only exact-size gate payloads. Both
+    // ranks reach this at the same point, so the endpoint swap is symmetric.
+    {
+        uint8_t local_ep[RPC_CONN_CAPS_SIZE]  = {};
+        uint8_t remote_ep[RPC_CONN_CAPS_SIZE] = {};
+        if (state.peer->gate_create(local_ep) &&
+            state.peer->send_data(local_ep, sizeof(local_ep)) &&
+            state.peer->flush() &&
+            state.peer->recv_data(remote_ep, sizeof(remote_ep))) {
+            state.peer->gate_activate(remote_ep);
+        }
+    }
+
     state.rank  = request.rank;
     state.world = request.world;
     state.fence_api_ok = rpc_fence_get(backends[request.device], state.fence_api);
@@ -2011,6 +2043,49 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                   __func__, request.device, request.rank, state.fence ? "on" : "off");
     response.ok = 1;
     return true;
+}
+
+// Bring the gate channel up for this payload size. Both ranks call this from the same
+// gate, having just exchanged it over the byte stream, so the one-byte handshake at the
+// end is a real barrier: seeing the peer's token proves it has posted its receives, and
+// a send before that would be dropped.
+void rpc_server::gate_arm(comm_state & state, const rpc_gate & g) {
+    // Arm once, for one size. Posted receives cannot be recalled, so re-arming at a
+    // different size would leave the old ones to be consumed by a send that does not
+    // match them. Gates of any other size keep using the byte stream, which is a
+    // different queue pair and so cannot touch these.
+    if (state.gate_tried || !state.peer->gate_ready()) {
+        return;
+    }
+    state.gate_tried = true;
+
+    bool ok = state.peer->gate_register(g.scratch_base, g.scratch_size) &&
+              state.peer->gate_register(const_cast<void *>(g.send_base), g.send_size);
+
+    // post in the order the coming gates will consume them: gate i lands in slot i mod N
+    for (uint32_t j = 1; ok && j <= RPC_GATE_SLOTS; j++) {
+        const uint32_t slot = (g.seq + j) % RPC_GATE_SLOTS;
+        ok = state.peer->gate_post_recv((uint8_t *) g.recv_base + (size_t) slot * g.recv_stride,
+                                        g.wire_bytes, 0);
+    }
+
+    // Both ranks reach this from the same gate, so the swap is a barrier: seeing the
+    // peer's token proves it has posted, and a send before that would be dropped. The
+    // token carries whether that rank managed to arm, so the two never disagree.
+    uint8_t mine = ok ? 1 : 0;
+    uint8_t theirs = 0;
+    if (!state.peer->send_data(&mine, 1) || !state.peer->flush() ||
+        !state.peer->recv_data(&theirs, 1)) {
+        return;
+    }
+
+    state.gate_armed = mine && theirs;
+    state.gate_size  = g.wire_bytes;
+    if (state.gate_armed) {
+        GGML_LOG_INFO("[%s] gate channel armed for %zu byte payloads\n", __func__, g.wire_bytes);
+    } else {
+        GGML_LOG_INFO("[%s] gate channel unavailable, using the byte stream\n", __func__);
+    }
 }
 
 // Drains queued gates: wait for the GPU to reach each one, exchange, release it. Runs on
@@ -2064,12 +2139,31 @@ void rpc_server::comm_service(comm_state & state) {
         }
 
         if (ok) {
-            if (g.wire_bytes <= RPC_GATE_DUPLEX_MAX) {
+            if (state.gate_armed && state.gate_size == g.wire_bytes) {
+                // exact-size, no header, straight into the slot the reduce will read
+                ok = state.peer->gate_send(g.send_src, g.wire_bytes) &&
+                     state.peer->gate_wait_recv(0, 30*1000*1000, ggml_time_us);
+                if (ok) {
+                    // this gate's slot is free again and gate seq+RPC_GATE_SLOTS will
+                    // land in it, so repost it now to keep the window open
+                    const uint32_t slot = g.seq % RPC_GATE_SLOTS;
+                    ok = state.peer->gate_post_recv(
+                            (uint8_t *) g.recv_base + (size_t) slot * g.recv_stride,
+                            g.wire_bytes, 0);
+                }
+                if (!ok) {
+                    GGML_LOG_ERROR("[%s] gate channel failed, falling back\n", __func__);
+                    state.gate_armed = false;
+                }
+            } else if (g.wire_bytes <= RPC_GATE_DUPLEX_MAX) {
                 // both directions in flight at once: the link is full duplex and the peer
                 // has a deep pre-posted ring, so a payload this size cannot stall
                 ok = state.peer->send_data(g.send_src, g.wire_bytes) &&
                      state.peer->flush() &&
                      state.peer->recv_data(g.recv_dst, g.wire_bytes);
+                if (ok) {
+                    gate_arm(state, g);
+                }
             } else if (state.rank == 0) {
                 // a big payload can outrun the ring, so the ranks take turns
                 ok = state.peer->send_data(g.send_src, g.wire_bytes) &&
@@ -2177,8 +2271,15 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     // the fenced path needs a word of its own in the scratch: the fence writes it and
     // the reduce reads the same buffer, which is what orders them
-    const size_t guard_offs = GGML_PAD(wire_bf16 ? 2*nbytes : nbytes, 32);
-    const size_t need       = guard_offs + 32;
+    // bf16: [wire_send][wire_recv x SLOTS][peer]   f32: [peer x SLOTS]
+    // only the region the peer's NIC writes rotates; the GPU-written ones are already
+    // serialized by the fence
+    const size_t nic_bytes   = wire_bf16 ? (size_t) ne*2 : nbytes;
+    const size_t nic_base    = wire_bf16 ? (size_t) ne*2 : 0;
+    const size_t after_slots = nic_base + RPC_GATE_SLOTS*nic_bytes;
+    const size_t guard_offs  = GGML_PAD(wire_bf16 ? after_slots + nbytes : after_slots, 32);
+    const size_t need        = guard_offs + 32;
+    const uint32_t slot      = (state.fence_seq + 1) % RPC_GATE_SLOTS;
     if (state.scratch_size < need) {
         // Gates already encoded read this scratch, so it cannot be replaced before the
         // GPU is done with it: the pages are the caller's and Metal does not keep them
@@ -2241,12 +2342,14 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     // wire staging, built up front so the batched path can encode the cast before the
     // arrival publish: the publish has to order after whatever the host will read
-    ggml_tensor * t_wire_send = wire_bf16 ? new_scratch_tensor(GGML_TYPE_BF16, 0)      : nullptr;
-    ggml_tensor * t_wire_recv = wire_bf16 ? new_scratch_tensor(GGML_TYPE_BF16, ne*2)   : nullptr;
+    ggml_tensor * t_wire_send = wire_bf16 ? new_scratch_tensor(GGML_TYPE_BF16, 0) : nullptr;
+    ggml_tensor * t_wire_recv = wire_bf16
+        ? new_scratch_tensor(GGML_TYPE_BF16, nic_base + slot*nic_bytes) : nullptr;
     ggml_tensor * const t_send = wire_bf16 ? t_wire_send : t_dst;
     ggml_tensor * const t_recv = t_wire_recv;
 
-    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type, wire_bf16 ? (size_t) ne*4 : 0);
+    ggml_tensor * t_peer = new_scratch_tensor(t_dst->type,
+        wire_bf16 ? after_slots : slot*nic_bytes);
     ggml_tensor * t_cast = wire_bf16 ? new_cpy_node(t_wire_recv, t_peer) : nullptr;
 
     ggml_tensor * t_red = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
@@ -2295,11 +2398,17 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         submit_reduce();
 
         rpc_gate g;
-        g.seq        = seq;
-        g.send_src   = send_src;
-        g.recv_dst   = recv_dst;
-        g.wire_bytes = wire_bytes;
-        g.wire_bf16  = wire_bf16;
+        g.seq          = seq;
+        g.send_src     = send_src;
+        g.recv_dst     = recv_dst;
+        g.wire_bytes   = wire_bytes;
+        g.wire_bf16    = wire_bf16;
+        g.recv_base    = scratch_base + nic_base;
+        g.recv_stride  = nic_bytes;
+        g.scratch_base = scratch_base;
+        g.scratch_size = state.scratch_size;
+        g.send_base    = ggml_backend_buffer_get_base(t_send->buffer);
+        g.send_size    = ggml_backend_buffer_get_size(t_send->buffer);
         {
             std::lock_guard<std::mutex> lock(state.mtx);
             state.queue.push_back(g);
