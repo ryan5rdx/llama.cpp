@@ -62,11 +62,47 @@ gate 1 is the one that broke.
 Fixed by deciding per gate whether a doorbell was actually sent, rather than re-reading
 mutable state after the exchange.
 
+### The target, and where the gap is
+
+ds4 runs the same model on the same two M2 Ultras at **41.98 t/s** decode
+(`QA_BEFORE_RELEASES.md:718`), against 14.17 here. Its measured per-token budget
+(`speed-bench/tp_decode_investigation.md:263`, ctx 512, 41.56 t/s = 24.06 ms/token):
+
+| stage | ms |
+|---|---|
+| routed MoE | 6.17 |
+| **TP gate sync (86 gates x 38 us)** | **3.30** |
+| attn output | 2.88 |
+| attn core | 2.68 |
+| dispatch overhead (1021 x 1.9 us) | 1.94 |
+| q_b, shared expert, HC mix, head, residual | ~6.4 |
+| **bubble, non-GPU** | **0.66** |
+
+GPU busy is 97.3% of ds4's wall clock, and it issues **3 command buffers per token**.
+
+Two things follow, and they set the whole agenda:
+
+**Prefill is already at parity.** 344 t/s here against ds4's 274.75 at ctx 512 and 381.3
+at ctx 2048. Prefill is compute-bound and amortizes the gates, so the Metal kernels and
+the model execution are not the problem. The entire deficit is per-token overhead.
+
+**The gate exchange is at parity too.** ds4 measures 38 us per gate; `exch` here is
+45.7 us. The wire is not where the time goes.
+
+Real GPU work is therefore about `24.06 - 3.30 - 0.66` = **20.1 ms/token**, leaving
+**~50 ms of overhead** in the 70.6 ms here. The blocking gate needs one command buffer
+for the split and one for the reduce at every gate, so ~172 per token against ds4's 3.
+At 150-300 us per submit-to-complete round trip - ds4's own bench implies that range, and
+it matches a local M1 Max measurement - that is 26-52 ms, which spans the whole gap.
+
+**Command buffer round trips are the delta.** Arms 3 to 6 exist to collapse 172 to 1,
+which is the only reason to expect them to matter. If arm 3 does not move `wait`, that
+conclusion is wrong and the rest of the branch should be reconsidered rather than
+extended.
+
 ### Not yet run
 
 Arms 0, 1, 4, 5, 6, every correctness gate in section 6, and the single-node reference.
-That reference matters most: without it there is no baseline for what 14.17 t/s should
-be, and if the model fits on one node, TP has to beat it rather than merely work.
 
 ---
 
