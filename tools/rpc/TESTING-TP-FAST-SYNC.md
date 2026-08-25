@@ -162,6 +162,26 @@ its probe line should read `ring=128 x 16 KiB`, while the client link stays
 `ring=16 x 128 KiB`. If the peer link still says 128 KiB, the negotiation did not take
 and every gate is padding a 28 KiB payload into 128 KiB.
 
+**The gate channel came up.** A second queue pair carries the gate payloads:
+
+```
+RDMA(Apple/UC) gate channel up: qpn=...->...
+```
+
+**The channel armed, and whether the doorbell did.** This appears on the *second* gate of
+a session, because the first goes over the byte stream and doubles as the arming barrier:
+
+```
+[gate_arm] gate channel armed for 28672 byte payloads, doorbell on
+```
+
+`doorbell off` means the fence words could not be registered - they are a Metal
+allocation rather than the ggml one your `rdma_caps` run verified. Payloads still take
+the fast path; only the release goes back through the host.
+`gate channel unavailable` means one of the two ranks failed to arm, and both agreed to
+stay on the byte stream. That is the designed outcome, not a fault, but it means none of
+the gate-channel arms below are actually being measured.
+
 **The communicator formed.**
 
 ```
@@ -185,7 +205,9 @@ Run in this order. Each arm isolates one change, so a regression points somewher
 | 1 | `GGML_RPC_NO_RDMA=1` | gate cost with TCP as the bottleneck |
 | 2 | *(none)* | **baseline** - RDMA, blocking gate |
 | 3 | `GGML_RPC_METAL_FAST_SYNC=1` | the fence, one submission per gate |
-| 4 | `GGML_RPC_METAL_FAST_SYNC=1 GGML_METAL_BATCH=1` | **everything** - a token per submission |
+| 4 | `GGML_RPC_METAL_FAST_SYNC=1 GGML_METAL_BATCH=1 GGML_RPC_NO_GATE_CHANNEL=1` | a token per submission, gates on the byte stream |
+| 5 | `GGML_RPC_METAL_FAST_SYNC=1 GGML_METAL_BATCH=1 GGML_RPC_NO_DOORBELL=1` | exact-size gate channel, host still releases |
+| 6 | `GGML_RPC_METAL_FAST_SYNC=1 GGML_METAL_BATCH=1` | **everything** - the peer's NIC releases the fence |
 
 Environment goes on **both servers**, not the client. Restart both between arms.
 
@@ -205,8 +227,15 @@ What each column should do:
 - `pack` and `unpack` are near zero whenever the payload is host-visible.
 - `exch` is the wire and should be roughly flat across arms 2-4. **If `exch` moves, be
   suspicious of the measurement**, not pleased.
-- In arm 4 `pack`/`unpack`/`submit` are structurally zero: the payload moves straight to
-  and from device memory and the reduce was encoded long before.
+- In arm 4 and later `pack`/`unpack`/`submit` are structurally zero: the payload moves
+  straight to and from device memory and the reduce was encoded long before.
+- Arm 5 should shave the residual framing: a 28 KiB payload moves 28 KiB instead of being
+  rounded up to two 16 KiB frames.
+- **Arm 6 is the one to watch.** `exch` stops being a round trip and becomes send-only,
+  because the host no longer waits for the incoming partial - the peer's NIC lands it and
+  then releases the GPU. If `exch` in arm 6 is not markedly below arm 5, the doorbell is
+  not doing anything and the first thing to check is that the arming line said
+  `doorbell on` on **both** nodes.
 
 Also record, from the profile line, the **gates per token** (`gates` divided by tokens
 generated). Everything scales with it and it has never been measured.
@@ -258,7 +287,19 @@ thread teardown is wrong.
 
 **Scratch growth.** Run a short prompt then a much longer one against the same server
 without restarting. This exercises the path that grows the comm scratch mid-stream, which
-has to synchronise the GPU before unmapping the old pages.
+has to synchronise the GPU before unmapping the old pages. Note the gate channel arms
+once for one payload size and registers the scratch at that moment; growing the scratch
+replaces the memory the channel registered, so watch for a fallback or a failure here
+specifically - this is the interaction I would expect to break first.
+
+**Mixed payload sizes.** A prompt long enough to run prefill gates (bf16, large) and then
+decode gates (f32, small) in the same session. Only one size gets the gate channel; the
+other must fall back to the byte stream cleanly and produce identical output.
+
+**Slot rotation under a peer that runs ahead.** Hard to force directly, but a long
+generation with `GGML_RPC_PROFILE=64` and correctness checked at the end covers it: the
+peer may run up to three gates ahead, and if the rotation is wrong the reduce reads a
+partial that has already been overwritten. Wrong output with no error is the signature.
 
 ---
 
@@ -268,6 +309,8 @@ has to synchronise the GPU before unmapping the old pages.
 |---|---|---|---|
 | `GGML_RPC_METAL_FAST_SYNC` | server | off | GPU-side fence instead of a blocking wait per gate |
 | `GGML_METAL_BATCH` | server | off | Metal defers submission; a token costs one submission |
+| `GGML_RPC_NO_GATE_CHANNEL` | server | off | keep gates on the byte stream |
+| `GGML_RPC_NO_DOORBELL` | server | off | keep the gate channel, host writes the release |
 | `GGML_RPC_FENCE_MAX_ITERS` | server | 8000000 | bound on the GPU fence spin |
 | `GGML_RPC_PROFILE` | server | off | report gate cost every N gates |
 | `GGML_RPC_NO_RDMA` | either | off | force TCP |
@@ -288,11 +331,17 @@ timeout, and 122 inline fences in one command buffer driven by a service thread.
 **Never executed anywhere:**
 
 - the RPC service thread against a real peer,
-- the zero-copy send (`send_from`), which additionally depends on the two provider
-  capabilities in section 1,
 - the frame-size negotiation,
 - the duplex gate exchange,
+- the gate channel: second queue pair, registration, exact-size pre-posted receives, slot
+  rotation, and the arming barrier,
+- the doorbell,
 - every failure path in section 6.
+
+The gate channel and the doorbell are the largest untested surface, and their failure
+modes are the quiet kind. A frame-count mismatch, a missed repost or a slot collision
+shows up as a hang or as wrong output, not as an error - which is why the byte-identical
+check in section 6 matters more than any timing number here.
 
 Two structural costs are known and unfixed. Each per-gate `GRAPH_RECOMPUTE` and
 `COMM_ALLREDUCE` from the client is a separate RPC message on the client link, which

@@ -116,6 +116,21 @@ static inline void rpc_fence_store(volatile uint32_t * w, uint32_t v) {
 // is still reducing for gate i - the fence orders our own GPU, not the peer's NIC.
 static constexpr uint32_t RPC_GATE_SLOTS = 4;
 
+// GGML_RPC_NO_GATE_CHANNEL=1 keeps gates on the byte stream; GGML_RPC_NO_DOORBELL=1 keeps
+// the channel but has the host write the release word. Both exist so a regression can be
+// attributed to one change rather than the pair.
+static bool rpc_gate_channel_requested() {
+    const char * env = std::getenv("GGML_RPC_NO_GATE_CHANNEL");
+
+    return !(env && atoi(env) != 0);
+}
+
+static bool rpc_doorbell_requested() {
+    const char * env = std::getenv("GGML_RPC_NO_DOORBELL");
+
+    return !(env && atoi(env) != 0);
+}
+
 struct rpc_gate {
     uint32_t seq;
     const void * send_src;
@@ -2059,7 +2074,7 @@ void rpc_server::gate_arm(comm_state & state, const rpc_gate & g) {
     // different size would leave the old ones to be consumed by a send that does not
     // match them. Gates of any other size keep using the byte stream, which is a
     // different queue pair and so cannot touch these.
-    if (state.gate_tried || !state.peer->gate_ready()) {
+    if (state.gate_tried || !rpc_gate_channel_requested() || !state.peer->gate_ready()) {
         return;
     }
     state.gate_tried = true;
@@ -2071,7 +2086,8 @@ void rpc_server::gate_arm(comm_state & state, const rpc_gate & g) {
     // through and the host leaves the release path. Needs the fence words registered,
     // which is a Metal allocation rather than the ggml one, so treat it as optional.
     volatile uint32_t * fw = state.fence_api.words(state.fence);
-    const bool doorbell = ok && state.peer->gate_register((void *) fw, state.fence_api.words_size());
+    const bool doorbell = ok && rpc_doorbell_requested() &&
+                          state.peer->gate_register((void *) fw, state.fence_api.words_size());
 
     // post in the order the coming gates consume them: gate i lands in slot i mod N, and
     // its doorbell follows it, matching the order the peer sends them
