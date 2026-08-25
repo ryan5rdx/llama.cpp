@@ -62,8 +62,22 @@ struct apple_rdma_caps {
 
 static_assert(sizeof(apple_rdma_caps) == RPC_CONN_CAPS_SIZE, "apple_rdma_caps must match conn_caps size");
 
+// A gate message is one exact-size payload: no header, because both ranks derive the
+// length from the same tensor, and no padding, because the receive is posted at that
+// exact length. That is what fits the single scatter entry the provider grants, and it
+// is why this cannot share a queue pair with the byte stream, whose receives are posted
+// at a fixed size and would be consumed by a gate send.
+static constexpr uint64_t RDMA_GATE_RECV_WR = 1ull << 21;
+
 struct apple_rdma::impl {
     int fd = -1;                      // bootstrap TCP socket, kept as the liveness anchor
+
+    struct ibv_qp * gate_qp = nullptr;
+    struct ibv_cq * gate_cq = nullptr;
+    std::unordered_map<const void *, struct ibv_mr *> gate_mrs; // registered Metal regions
+    bool gate_ready = false;
+
+    struct ibv_mr * gate_mr_for(const void * addr, size_t len);
 
     struct ibv_context * ctx = nullptr;
     struct ibv_pd * pd = nullptr;
@@ -91,6 +105,8 @@ struct apple_rdma::impl {
     bool     broken = false;
 
     uint32_t     qpn = 0;
+    uint16_t     lid = 0;
+    uint8_t      gid[RDMA_GID_SIZE] = {};
     uint8_t      port = 0;
     int          gid_idx = 0;
     enum ibv_mtu path_mtu = IBV_MTU_1024;
@@ -137,6 +153,19 @@ struct apple_rdma::impl {
             while (ibv_poll_cq(cq, RDMA_NBUF_MAX * 2, wc) > 0) {}
             ibv_destroy_qp(qp);
         }
+        if (gate_qp) {
+            struct ibv_qp_attr a = {};
+            a.qp_state = IBV_QPS_ERR;
+            ibv_modify_qp(gate_qp, &a, IBV_QP_STATE);
+            struct ibv_wc wc[RDMA_NBUF_MAX];
+            while (gate_cq && ibv_poll_cq(gate_cq, RDMA_NBUF_MAX, wc) > 0) {}
+            ibv_destroy_qp(gate_qp);
+        }
+        for (auto & kv : gate_mrs) {
+            ibv_dereg_mr(kv.second);
+        }
+        gate_mrs.clear();
+        if (gate_cq) ibv_destroy_cq(gate_cq);
         if (send_mr) ibv_dereg_mr(send_mr);
         if (recv_mr) ibv_dereg_mr(recv_mr);
         free(send_mem);
@@ -280,6 +309,8 @@ std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid
     // provider rejects ibv_post_recv on a QP that has not reached RTS.
 
     c->qpn = c->qp->qp_num;
+    c->lid = pa.lid;
+    memcpy(c->gid, gid.raw, RDMA_GID_SIZE);
 
     apple_rdma_caps rc = {};
     rc.qpn = c->qpn;
@@ -496,6 +527,210 @@ bool apple_rdma::recv(void * data, size_t size) {
 
 bool apple_rdma::flush() {
     return pimpl->post_pending();
+}
+
+// Build the gate queue pair and describe it for the peer. The endpoint blob travels
+// over the byte stream the caller already has.
+bool apple_rdma::gate_create(uint8_t * local_ep) {
+    impl * c = pimpl.get();
+    if (c->broken || c->gate_qp) {
+        return false;
+    }
+
+    c->gate_cq = ibv_create_cq(c->ctx, 2 * RDMA_QP_WR + 1, nullptr, nullptr, 0);
+    if (!c->gate_cq) {
+        return false;
+    }
+
+    ibv_qp_init_attr qia = {};
+    qia.send_cq = c->gate_cq;
+    qia.recv_cq = c->gate_cq;
+    qia.qp_type = IBV_QPT_UC;
+    qia.cap.max_send_wr  = RDMA_QP_WR;
+    qia.cap.max_recv_wr  = RDMA_QP_WR;
+    qia.cap.max_send_sge = 1;
+    qia.cap.max_recv_sge = 1;
+    c->gate_qp = ibv_create_qp(c->pd, &qia);
+    if (!c->gate_qp) {
+        GGML_LOG_WARN("RDMA(Apple/UC) gate queue pair unavailable, gates stay on the byte stream\n");
+        return false;
+    }
+
+    {
+        ibv_qp_attr a = {};
+        a.qp_state = IBV_QPS_INIT;
+        a.pkey_index = 0;
+        a.port_num = c->port;
+        a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE;
+        if (ibv_modify_qp(c->gate_qp, &a,
+                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+            return false;
+        }
+    }
+
+    apple_rdma_caps ep = {};
+    ep.qpn = c->gate_qp->qp_num;
+    ep.lid = c->lid;
+    memcpy(ep.gid, c->gid, RDMA_GID_SIZE);
+    memcpy(local_ep, &ep, sizeof(ep));
+
+    return true;
+}
+
+bool apple_rdma::gate_activate(const uint8_t * remote_ep) {
+    impl * c = pimpl.get();
+    if (!c->gate_qp) {
+        return false;
+    }
+
+    apple_rdma_caps ep = {};
+    memcpy(&ep, remote_ep, sizeof(ep));
+
+    ibv_qp_attr a = {};
+    a.qp_state    = IBV_QPS_RTR;
+    a.path_mtu    = c->path_mtu;
+    a.rq_psn      = RDMA_PSN;
+    a.dest_qp_num = ep.qpn;
+    a.ah_attr.is_global      = 1;
+    a.ah_attr.port_num       = c->port;
+    a.ah_attr.dlid           = ep.lid;
+    a.ah_attr.grh.hop_limit  = 1;
+    a.ah_attr.grh.sgid_index = (uint8_t)c->gid_idx;
+    memcpy(&a.ah_attr.grh.dgid, ep.gid, RDMA_GID_SIZE);
+    if (ibv_modify_qp(c->gate_qp, &a,
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN) != 0) {
+        GGML_LOG_ERROR("RDMA(Apple/UC) gate RTR failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTS;
+    a.sq_psn   = RDMA_PSN;
+    if (ibv_modify_qp(c->gate_qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+        GGML_LOG_ERROR("RDMA(Apple/UC) gate RTS failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    c->gate_ready = true;
+    GGML_LOG_INFO("RDMA(Apple/UC) gate channel up: qpn=%u->%u\n", c->gate_qp->qp_num, ep.qpn);
+
+    return true;
+}
+
+bool apple_rdma::gate_ready() const {
+    return pimpl->gate_ready && !pimpl->broken;
+}
+
+// Register a region the gate channel will send from or receive into. Metal's shared
+// buffers are ordinary page-aligned host memory, so this succeeds on them.
+bool apple_rdma::gate_register(void * addr, size_t size) {
+    impl * c = pimpl.get();
+    if (!c->gate_ready || addr == nullptr) {
+        return false;
+    }
+    if (c->gate_mrs.count(addr)) {
+        return true;
+    }
+    struct ibv_mr * mr = ibv_reg_mr(c->pd, addr, size,
+                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!mr) {
+        GGML_LOG_WARN("RDMA(Apple/UC) cannot register %zu bytes for the gate channel\n", size);
+        return false;
+    }
+    c->gate_mrs[addr] = mr;
+    return true;
+}
+
+// Find the registration covering [addr, addr+len).
+struct ibv_mr * apple_rdma::impl::gate_mr_for(const void * addr, size_t len) {
+    for (auto & kv : gate_mrs) {
+        const uint8_t * base = (const uint8_t *) kv.first;
+        const uint8_t * p    = (const uint8_t *) addr;
+        if (p >= base && p + len <= base + kv.second->length) {
+            return kv.second;
+        }
+    }
+    return nullptr;
+}
+
+bool apple_rdma::gate_post_recv(void * dst, size_t len, uint64_t tag) {
+    impl * c = pimpl.get();
+    struct ibv_mr * mr = c->gate_ready ? c->gate_mr_for(dst, len) : nullptr;
+    if (!mr) {
+        return false;
+    }
+
+    struct ibv_sge sge = {};
+    sge.addr   = (uintptr_t) dst;
+    sge.length = (uint32_t) len;
+    sge.lkey   = mr->lkey;
+
+    struct ibv_recv_wr wr = {}, * bad = nullptr;
+    wr.wr_id   = RDMA_GATE_RECV_WR | tag;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    return ibv_post_recv(c->gate_qp, &wr, &bad) == 0;
+}
+
+bool apple_rdma::gate_send(const void * src, size_t len) {
+    impl * c = pimpl.get();
+    struct ibv_mr * mr = c->gate_ready ? c->gate_mr_for(src, len) : nullptr;
+    if (!mr) {
+        return false;
+    }
+
+    struct ibv_sge sge = {};
+    sge.addr   = (uintptr_t) src;
+    sge.length = (uint32_t) len;
+    sge.lkey   = mr->lkey;
+
+    struct ibv_send_wr wr = {}, * bad = nullptr;
+    wr.wr_id      = 0;
+    wr.sg_list    = &sge;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    if (ibv_post_send(c->gate_qp, &wr, &bad) != 0) {
+        c->broken = true;
+        return false;
+    }
+
+    return true;
+}
+
+// Reap gate completions until one recv carrying `tag` lands. Sends complete on the same
+// queue and are just released.
+bool apple_rdma::gate_wait_recv(uint64_t tag, int64_t timeout_us, int64_t (*now_us)(void)) {
+    impl * c = pimpl.get();
+    if (!c->gate_ready) {
+        return false;
+    }
+
+    const int64_t deadline = now_us() + timeout_us;
+    for (;;) {
+        struct ibv_wc wc[RDMA_NBUF_MAX];
+        const int n = ibv_poll_cq(c->gate_cq, RDMA_NBUF_MAX, wc);
+        if (n < 0) {
+            c->broken = true;
+            return false;
+        }
+        for (int j = 0; j < n; j++) {
+            if (wc[j].status != IBV_WC_SUCCESS) {
+                GGML_LOG_ERROR("RDMA(Apple/UC) gate wc error: status=%d\n", wc[j].status);
+                c->broken = true;
+                return false;
+            }
+            if ((wc[j].wr_id & RDMA_GATE_RECV_WR) && (wc[j].wr_id & ~RDMA_GATE_RECV_WR) == tag) {
+                return true;
+            }
+        }
+        if (n == 0 && now_us() > deadline) {
+            GGML_LOG_ERROR("RDMA(Apple/UC) gate recv timed out\n");
+            return false;
+        }
+    }
 }
 
 void apple_rdma::prefer_small_frames() {

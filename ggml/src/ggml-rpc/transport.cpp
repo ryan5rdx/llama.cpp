@@ -594,6 +594,88 @@ bool socket_t::impl::flush() {
     return true;
 }
 
+// Gate channel. Only the Apple RDMA transport has one; everywhere else these all fail
+// and the caller keeps exchanging over send_data/recv_data.
+bool socket_t::gate_create(uint8_t * local_ep) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->rdma) {
+        return pimpl->rdma->gate_create(local_ep);
+    }
+#else
+    GGML_UNUSED(local_ep);
+#endif
+    return false;
+}
+
+bool socket_t::gate_activate(const uint8_t * remote_ep) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->rdma) {
+        return pimpl->rdma->gate_activate(remote_ep);
+    }
+#else
+    GGML_UNUSED(remote_ep);
+#endif
+    return false;
+}
+
+bool socket_t::gate_ready() const {
+#ifdef GGML_RPC_RDMA_APPLE
+    return pimpl->rdma && pimpl->rdma->gate_ready();
+#else
+    return false;
+#endif
+}
+
+bool socket_t::gate_register(void * addr, size_t size) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->rdma) {
+        return pimpl->rdma->gate_register(addr, size);
+    }
+#else
+    GGML_UNUSED(addr);
+    GGML_UNUSED(size);
+#endif
+    return false;
+}
+
+bool socket_t::gate_post_recv(void * dst, size_t len, uint64_t tag) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->rdma) {
+        return pimpl->rdma->gate_post_recv(dst, len, tag);
+    }
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(len);
+    GGML_UNUSED(tag);
+#endif
+    return false;
+}
+
+bool socket_t::gate_send(const void * src, size_t len) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->rdma) {
+        return pimpl->rdma->gate_send(src, len);
+    }
+#else
+    GGML_UNUSED(src);
+    GGML_UNUSED(len);
+#endif
+    return false;
+}
+
+bool socket_t::gate_wait_recv(uint64_t tag, int64_t timeout_us, int64_t (*now_us)(void)) {
+#ifdef GGML_RPC_RDMA_APPLE
+    if (pimpl->rdma) {
+        return pimpl->rdma->gate_wait_recv(tag, timeout_us, now_us);
+    }
+#else
+    GGML_UNUSED(tag);
+    GGML_UNUSED(timeout_us);
+    GGML_UNUSED(now_us);
+#endif
+    return false;
+}
+
 // Ask for a small frame size on this link, before caps are exchanged. Only the Apple
 // transport pads to a fixed frame, so it is a no-op elsewhere.
 void socket_t::prefer_small_frames() {

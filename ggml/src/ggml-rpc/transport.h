@@ -20,6 +20,18 @@ struct socket_t {
     // here. No-op on TCP.
     bool flush();
 
+    // Gate channel: a side channel for exact-size messages that land straight in
+    // registered caller memory, with no header and no padding. All of these return
+    // false where the transport has no such channel, and the caller falls back to
+    // send_data/recv_data.
+    bool gate_create  (uint8_t * local_ep);   // fills RPC_CONN_CAPS_SIZE bytes
+    bool gate_activate(const uint8_t * remote_ep);
+    bool gate_ready() const;
+    bool gate_register (void * addr, size_t size);
+    bool gate_post_recv(void * dst, size_t len, uint64_t tag);
+    bool gate_send     (const void * src, size_t len);
+    bool gate_wait_recv(uint64_t tag, int64_t timeout_us, int64_t (*now_us)(void));
+
     // Ask for a small frame size: a whole frame goes on the wire however little of it
     // is filled, so a link carrying small messages wants this and a bulk link does not.
     void prefer_small_frames();
