@@ -3,13 +3,70 @@
 How to exercise `-sm tensor` across two Apple silicon Macs joined by a Thunderbolt cable,
 on branch `apple-rdma-tp-fast-sync`.
 
-Nothing in the fast-sync or batching path has ever run on real hardware. The Metal
-primitives underneath are tested locally; the RPC restructuring, the zero-copy send and
-the frame-size negotiation are not. Expect to find bugs, and read
-[What is unproven](#what-is-unproven) before trusting a number.
+The RDMA baseline now runs on real hardware. The fast-sync path has had exactly one run,
+which hung on a bug that is since fixed; nothing past it has been exercised. Read
+[Status](#status) for where things stand and [What is unproven](#what-is-unproven) before
+trusting a number.
 
 Throughout, `A` and `B` are the two nodes, `$TB_A` and `$TB_B` their Thunderbolt
 addresses.
+
+---
+
+## Status
+
+First run on two M-series Macs over Thunderbolt, nodes `lanfear` (rank 0) and `mat`
+(rank 1).
+
+### Arm 2, baseline RDMA with the blocking gate - works
+
+```
+pp512 = 344.15 +/- 2.97 t/s
+tg128 =  14.17 +/- 0.19 t/s
+```
+
+`decode/f32` gate, 16 KiB payload, microseconds per gate:
+
+| node | wait | exch | submit |
+|---|---|---|---|
+| lanfear (rank 0) | 621 | 45.7 | 10.8 |
+| mat (rank 1) | 608 | 101.5 | 10.8 |
+
+Both ranks reported `joined pairwise comm`, `fast sync off`, which is correct for this
+arm.
+
+What it says: at ~678 us per gate and 70.6 ms per token, the gates account for roughly
+104 per token and for essentially all of decode. `wait` is 91% of that and `exch` is 7%.
+**The link is not the bottleneck; the submission architecture is.** Each gate is its own
+submit-block-exchange-submit cycle, so the GPU is torn down and rebuilt ~104 times a
+token and sits idle through every exchange. The 101.5 us on `mat` against 45.7 on
+`lanfear` is arrival skew, one rank waiting on the other, not wire cost.
+
+Arm 2 has none of this branch's changes active. It is the "before" number and not a
+comparison point against ds4, which runs one command buffer per token with in-shader
+fences and never returns to the host mid-token.
+
+### Arm 3, fast sync - hung, fixed, not yet re-run
+
+Both ranks armed cleanly (`fast sync on`, fence enabled, gate channel up), then rank 1
+logged `[comm_service] gate 2 never arrived` and both stalled until killed.
+
+Cause: `gate_arm()` sets `gate_doorbell` and `gate_size` partway through the gate that
+arms it, and the release decision at the end of that same gate read the mutated state and
+concluded the peer's NIC would write the release word. But gate 1 is exchanged over the
+byte stream and has no doorbell behind it, so nobody wrote the word. The GPU spun in gate
+1's wait kernel and never reached gate 2's publish. Deterministic, and identical on both
+ranks, which is why rank 0 stalled without logging anything. The log names gate 2, but
+gate 1 is the one that broke.
+
+Fixed by deciding per gate whether a doorbell was actually sent, rather than re-reading
+mutable state after the exchange.
+
+### Not yet run
+
+Arms 0, 1, 4, 5, 6, every correctness gate in section 6, and the single-node reference.
+That reference matters most: without it there is no baseline for what 14.17 t/s should
+be, and if the model fits on one node, TP has to beat it rather than merely work.
 
 ---
 
@@ -308,6 +365,7 @@ Run in this order. Each arm isolates one change, so a regression points somewher
 
 | # | server env | what it isolates |
 |---|---|---|
+| R | *single node, no `--rpc`, no `-sm tensor`* | **the number TP has to beat** |
 | 0 | `GGML_RPC_NO_RDMA=1`, `-sm layer` | plumbing only, no gates |
 | 1 | `GGML_RPC_NO_RDMA=1` | gate cost with TCP as the bottleneck |
 | 2 | *(none)* | **baseline** - RDMA, blocking gate |
@@ -345,7 +403,9 @@ What each column should do:
   `doorbell on` on **both** nodes.
 
 Also record, from the profile line, the **gates per token** (`gates` divided by tokens
-generated). Everything scales with it and it has never been measured.
+generated). Everything scales with it. Arm 2 implies roughly 104, derived from the gate
+cost against the token rate rather than counted directly - worth confirming from the
+counter itself.
 
 ### Machine noise
 
@@ -447,20 +507,29 @@ checked against two loopback servers: the command syntax in section 3, the `--co
 advertisement in the HELLO response, and the transport declining to probe RDMA on a
 local-equals-peer connection.
 
-**Never executed anywhere:**
+**Exercised on hardware** by the arm 2 run: the peer link over RDMA, the service thread
+against a real peer, the frame-size negotiation, and the duplex gate exchange on the byte
+stream. The arm 3 run additionally got as far as bringing up the gate channel and the
+arming barrier on both ranks before the release bug stopped it.
 
-- the RPC service thread against a real peer,
-- the frame-size negotiation,
-- the duplex gate exchange,
-- the gate channel: second queue pair, registration, exact-size pre-posted receives, slot
-  rotation, and the arming barrier,
+**Still never executed:**
+
+- the gate channel carrying a payload: exact-size pre-posted receives and slot rotation
+  came up but never moved a gate,
 - the doorbell,
+- the fence past gate 1, in particular the wait kernel completing normally rather than
+  spinning,
+- `GGML_METAL_BATCH=1` against a real peer,
 - every failure path in section 6.
 
-The gate channel and the doorbell are the largest untested surface, and their failure
+The gate channel and the doorbell remain the largest untested surface, and their failure
 modes are the quiet kind. A frame-count mismatch, a missed repost or a slot collision
 shows up as a hang or as wrong output, not as an error - which is why the byte-identical
 check in section 6 matters more than any timing number here.
+
+The one bug the rig has found so far was of exactly that shape: a release word nobody
+wrote, surfacing as a hang attributed to the wrong gate. Assume there are more, and
+re-run arms 3 through 6 in order rather than jumping to 6.
 
 Two structural costs are known and unfixed. Each per-gate `GRAPH_RECOMPUTE` and
 `COMM_ALLREDUCE` from the client is a separate RPC message on the client link, which
@@ -469,3 +538,8 @@ still frames at 128 KiB - roughly 245 frames per token to carry about 36 KiB. An
 unbatched path gets for free. Counting `post_send` calls and bytes per token on both
 sockets would turn the first of those from an estimate into a measurement, and is
 probably the single most informative thing to add.
+
+Arm 2 puts a number on why this matters: 91% of decode is the host blocked on the GPU,
+7% is the wire. Every arm from 3 onward exists to attack that 91%, so if arms 3 to 6 do
+not move `wait`, the rest of the branch is not earning its complexity and that is the
+result to report.
