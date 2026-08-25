@@ -71,6 +71,7 @@ struct rpc_fence_api {
     bool   (*publish)(void *, uint32_t, const ggml_tensor *)            = nullptr;
     bool   (*arm)    (void *, uint32_t, uint32_t, const ggml_tensor *) = nullptr;
     void   (*sync)   (void *)                    = nullptr;
+    size_t (*words_size)(void)                   = nullptr;
     bool   (*buffer_direct)(ggml_backend_buffer_t) = nullptr;
 };
 
@@ -89,8 +90,10 @@ static bool rpc_fence_get(ggml_backend_t backend, rpc_fence_api & api) {
     api.publish = (bool (*)(void *, uint32_t, const ggml_tensor *))           ggml_backend_reg_get_proc_address(reg, "ggml_backend_fence_publish");
     api.arm     = (bool (*)(void *, uint32_t, uint32_t, const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fence_arm");
     api.sync    = (void (*)(void *))                      ggml_backend_reg_get_proc_address(reg, "ggml_backend_fence_sync");
+    api.words_size = (size_t (*)(void))                   ggml_backend_reg_get_proc_address(reg, "ggml_backend_fence_words_size");
     api.buffer_direct = (bool (*)(ggml_backend_buffer_t))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_fence_buffer_direct");
-    return api.init && api.destroy && api.words && api.publish && api.arm && api.sync && api.buffer_direct;
+    return api.init && api.destroy && api.words && api.publish && api.arm && api.sync &&
+           api.buffer_direct && api.words_size;
 }
 
 // The fence words are plain shared memory the GPU also touches, so pair every access
@@ -127,6 +130,7 @@ struct rpc_gate {
     size_t       scratch_size = 0;
     const void * send_base    = nullptr;
     size_t       send_size    = 0;
+    void *       doorbell     = nullptr;   // this gate's staging word
 };
 
 // Bounded so a dead peer cannot leave the command processor spinning until the GPU
@@ -1175,9 +1179,10 @@ private:
         std::deque<rpc_gate>    queue;
 
         // gate channel state, touched only by the service thread
-        bool                    gate_armed = false;
-        bool                    gate_tried = false;
-        size_t                  gate_size  = 0;
+        bool                    gate_armed    = false;
+        bool                    gate_doorbell = false;
+        bool                    gate_tried    = false;
+        size_t                  gate_size     = 0;
         std::atomic<bool>       service_stop{false};
         bool                    service_failed = false;
         uint32_t                gates_done     = 0;
@@ -2062,27 +2067,39 @@ void rpc_server::gate_arm(comm_state & state, const rpc_gate & g) {
     bool ok = state.peer->gate_register(g.scratch_base, g.scratch_size) &&
               state.peer->gate_register(const_cast<void *>(g.send_base), g.send_size);
 
-    // post in the order the coming gates will consume them: gate i lands in slot i mod N
+    // The doorbell lands four bytes on our release word, so the peer's NIC lets the GPU
+    // through and the host leaves the release path. Needs the fence words registered,
+    // which is a Metal allocation rather than the ggml one, so treat it as optional.
+    volatile uint32_t * fw = state.fence_api.words(state.fence);
+    const bool doorbell = ok && state.peer->gate_register((void *) fw, state.fence_api.words_size());
+
+    // post in the order the coming gates consume them: gate i lands in slot i mod N, and
+    // its doorbell follows it, matching the order the peer sends them
     for (uint32_t j = 1; ok && j <= RPC_GATE_SLOTS; j++) {
         const uint32_t slot = (g.seq + j) % RPC_GATE_SLOTS;
         ok = state.peer->gate_post_recv((uint8_t *) g.recv_base + (size_t) slot * g.recv_stride,
                                         g.wire_bytes, 0);
+        if (ok && doorbell) {
+            ok = state.peer->gate_post_recv((void *) &fw[RPC_FENCE_RELEASE], sizeof(uint32_t), 0);
+        }
     }
 
     // Both ranks reach this from the same gate, so the swap is a barrier: seeing the
     // peer's token proves it has posted, and a send before that would be dropped. The
     // token carries whether that rank managed to arm, so the two never disagree.
-    uint8_t mine = ok ? 1 : 0;
+    uint8_t mine   = (ok ? 1 : 0) | ((ok && doorbell) ? 2 : 0);
     uint8_t theirs = 0;
     if (!state.peer->send_data(&mine, 1) || !state.peer->flush() ||
         !state.peer->recv_data(&theirs, 1)) {
         return;
     }
 
-    state.gate_armed = mine && theirs;
-    state.gate_size  = g.wire_bytes;
+    state.gate_armed    = (mine & theirs & 1) != 0;
+    state.gate_doorbell = (mine & theirs & 2) != 0;
+    state.gate_size     = g.wire_bytes;
     if (state.gate_armed) {
-        GGML_LOG_INFO("[%s] gate channel armed for %zu byte payloads\n", __func__, g.wire_bytes);
+        GGML_LOG_INFO("[%s] gate channel armed for %zu byte payloads, doorbell %s\n",
+                      __func__, g.wire_bytes, state.gate_doorbell ? "on" : "off");
     } else {
         GGML_LOG_INFO("[%s] gate channel unavailable, using the byte stream\n", __func__);
     }
@@ -2141,8 +2158,18 @@ void rpc_server::comm_service(comm_state & state) {
         if (ok) {
             if (state.gate_armed && state.gate_size == g.wire_bytes) {
                 // exact-size, no header, straight into the slot the reduce will read
-                ok = state.peer->gate_send(g.send_src, g.wire_bytes) &&
-                     state.peer->gate_wait_recv(0, 30*1000*1000, ggml_time_us);
+                ok = state.peer->gate_send(g.send_src, g.wire_bytes);
+
+                if (ok && state.gate_doorbell) {
+                    // The peer's NIC writes our release word, so nothing here waits for
+                    // the incoming payload: it lands, then the doorbell behind it lets
+                    // that peer's GPU through. Sends on one queue pair keep their order,
+                    // so the payload is always in place first.
+                    *(uint32_t *) g.doorbell = g.seq;
+                    ok = state.peer->gate_send(g.doorbell, sizeof(uint32_t));
+                } else if (ok) {
+                    ok = state.peer->gate_wait_recv(0, 30*1000*1000, ggml_time_us);
+                }
                 if (ok) {
                     // this gate's slot is free again and gate seq+RPC_GATE_SLOTS will
                     // land in it, so repost it now to keep the window open
@@ -2150,6 +2177,10 @@ void rpc_server::comm_service(comm_state & state) {
                     ok = state.peer->gate_post_recv(
                             (uint8_t *) g.recv_base + (size_t) slot * g.recv_stride,
                             g.wire_bytes, 0);
+                    if (ok && state.gate_doorbell) {
+                        ok = state.peer->gate_post_recv((void *) &fw[RPC_FENCE_RELEASE],
+                                                        sizeof(uint32_t), 0);
+                    }
                 }
                 if (!ok) {
                     GGML_LOG_ERROR("[%s] gate channel failed, falling back\n", __func__);
@@ -2181,9 +2212,13 @@ void rpc_server::comm_service(comm_state & state) {
 
         const int64_t t_exchanged = prof ? ggml_time_us() : 0;
 
-        // release even on failure: the reduce is already queued behind this fence and
-        // every later gate is queued behind that, so not releasing wedges the whole batch
-        rpc_fence_store(&fw[RPC_FENCE_RELEASE], g.seq);
+        // Release even on failure: the reduce is already queued behind this fence and
+        // every later gate is queued behind that, so not releasing wedges the whole
+        // batch. When the doorbell is up the peer's NIC does this for us, and writing it
+        // here as well would let the reduce run before the payload landed.
+        if (!state.gate_doorbell || !ok || g.wire_bytes != state.gate_size) {
+            rpc_fence_store(&fw[RPC_FENCE_RELEASE], g.seq);
+        }
 
         if (prof) {
             // pack, unpack and submit are structurally zero here: the payload moves
@@ -2278,7 +2313,10 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     const size_t nic_base    = wire_bf16 ? (size_t) ne*2 : 0;
     const size_t after_slots = nic_base + RPC_GATE_SLOTS*nic_bytes;
     const size_t guard_offs  = GGML_PAD(wire_bf16 ? after_slots + nbytes : after_slots, 32);
-    const size_t need        = guard_offs + 32;
+    // one doorbell staging word per slot: the NIC reads it after the post returns, so
+    // the next gate must not be writing the same word
+    const size_t db_offs     = guard_offs + 32;
+    const size_t need        = GGML_PAD(db_offs + RPC_GATE_SLOTS*sizeof(uint32_t), 32);
     const uint32_t slot      = (state.fence_seq + 1) % RPC_GATE_SLOTS;
     if (state.scratch_size < need) {
         // Gates already encoded read this scratch, so it cannot be replaced before the
@@ -2409,6 +2447,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         g.scratch_size = state.scratch_size;
         g.send_base    = ggml_backend_buffer_get_base(t_send->buffer);
         g.send_size    = ggml_backend_buffer_get_size(t_send->buffer);
+        g.doorbell     = scratch_base + db_offs + (size_t) slot*sizeof(uint32_t);
         {
             std::lock_guard<std::mutex> lock(state.mtx);
             state.queue.push_back(g);

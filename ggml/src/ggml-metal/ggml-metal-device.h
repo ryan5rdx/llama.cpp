@@ -350,6 +350,7 @@ typedef struct ggml_metal_fence * ggml_metal_fence_t;
 ggml_metal_fence_t  ggml_metal_fence_init (ggml_metal_device_t dev); // NULL if unsupported
 void                ggml_metal_fence_free (ggml_metal_fence_t f);
 volatile uint32_t * ggml_metal_fence_words(ggml_metal_fence_t f);
+size_t              ggml_metal_fence_words_size(void);
 
 // Store value into the arrival word. dep is read purely for ordering: Metal tracks
 // hazards per buffer, so this runs after whatever last wrote dep's buffer.

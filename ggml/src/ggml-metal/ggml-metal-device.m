@@ -2480,6 +2480,10 @@ void ggml_metal_fence_free(ggml_metal_fence_t f) {
     free(f);
 }
 
+size_t ggml_metal_fence_words_size(void) {
+    return GGML_METAL_FENCE_N_WORDS*sizeof(uint32_t);
+}
+
 volatile uint32_t * ggml_metal_fence_words(ggml_metal_fence_t f) {
     return f ? (volatile uint32_t *) f->words.contents : NULL;
 }

@@ -919,6 +919,10 @@ static volatile uint32_t * ggml_backend_metal_fence_words(void * fence) {
     return ggml_metal_fence_words((ggml_metal_fence_t)fence);
 }
 
+static size_t ggml_backend_metal_fence_words_size(void) {
+    return ggml_metal_fence_words_size();
+}
+
 static struct ggml_metal_buffer_id ggml_backend_metal_buf_id(const ggml_tensor * t) {
     if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_metal(t->buffer)) {
         return { nullptr, 0 };
@@ -961,6 +965,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_fence_words") == 0) {
         return (void *)ggml_backend_metal_fence_words;
+    }
+    if (strcmp(name, "ggml_backend_fence_words_size") == 0) {
+        return (void *)ggml_backend_metal_fence_words_size;
     }
     if (strcmp(name, "ggml_backend_fence_publish") == 0) {
         return (void *)ggml_backend_metal_fence_publish;
