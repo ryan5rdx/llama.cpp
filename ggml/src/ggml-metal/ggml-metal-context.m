@@ -24,6 +24,8 @@ struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
 };
 
+static void ggml_metal_gate_encode(ggml_metal_t ctx, ggml_metal_cmd_buf_t cmd_buf);
+
 struct ggml_metal {
     char name[128];
 
@@ -74,6 +76,11 @@ struct ggml_metal {
 
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
+
+    // a tensor-parallel gate to encode at the tail of the next graph's last
+    // command buffer, see ggml_metal_set_gate_epilogue
+    struct ggml_metal_gate gate;
+    bool                   gate_armed;
 
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
@@ -765,10 +772,70 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         ggml_metal_op_free(ctx_op);
 
+        // buffers run n_cb, 0, 1, ... so the last tail buffer runs last;
+        // gate_encode clears gate_armed
+        const int cb_last = ctx->n_nodes_1 > 0 ? n_cb_l - 1 : n_cb_l;
+        if (ctx->gate_armed && (cb_idx == cb_last || (n_cb_l == 0 && cb_idx == n_cb))) {
+            ggml_metal_gate_encode(ctx, (__bridge void *) cmd_buf);
+        }
+
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
         }
     });
+}
+
+static struct ggml_metal_pipeline_with_params ggml_metal_gate_pipeline(ggml_metal_t ctx) {
+    struct ggml_metal_pipeline_with_params ppl = ggml_metal_library_get_pipeline(
+        ggml_metal_device_get_library(ctx->dev), "ggml_metal_gate_wait_reduce_f32");
+    if (ppl.pipeline == nil) {
+        ppl = ggml_metal_library_compile_pipeline(
+            ggml_metal_device_get_library(ctx->dev), "ggml_metal_gate_wait_reduce_f32", "ggml_metal_gate_wait_reduce_f32", NULL);
+    }
+    return ppl;
+}
+
+// the GPU parks here after the graph's work instead of after its completion
+static void ggml_metal_gate_encode(ggml_metal_t ctx, ggml_metal_cmd_buf_t cmd_buf) {
+    const struct ggml_metal_gate g = ctx->gate;
+    ctx->gate_armed = false;
+
+    struct ggml_metal_pipeline_with_params ppl = ggml_metal_gate_pipeline(ctx);
+    if (ppl.pipeline == nil) {
+        GGML_LOG_ERROR("%s: gate kernel not found in the metal library\n", __func__);
+        return;
+    }
+
+    ggml_metal_encoder_t enc = ggml_metal_encoder_init(cmd_buf, false);
+    ggml_metal_encoder_set_pipeline(enc, ppl);
+
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(g.dst),  0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(g.peer), 1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(g.words), 2);
+
+    const uint32_t seq   = g.seq;
+    const uint32_t maxit = g.max_iters;
+    const uint32_t n     = (uint32_t) ggml_nelements(g.dst);
+    const uint32_t tgs   = MIN((n + 8*256 - 1)/(8*256), 128u);
+    ggml_metal_encoder_set_bytes(enc, &seq,   4, 3);
+    ggml_metal_encoder_set_bytes(enc, &maxit, 4, 4);
+    ggml_metal_encoder_set_bytes(enc, &n,     4, 5);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, tgs, 1, 1, 256, 1, 1);
+    ggml_metal_encoder_end_encoding(enc);
+    ggml_metal_encoder_free(enc);
+}
+
+bool ggml_metal_set_gate_epilogue(ggml_metal_t ctx, const struct ggml_metal_gate * gate) {
+    if (ggml_metal_gate_pipeline(ctx).pipeline == nil) {
+        return false;
+    }
+    if (gate->dst->type != GGML_TYPE_F32 || gate->peer->type != GGML_TYPE_F32) {
+        return false;
+    }
+    ctx->gate       = *gate;
+    ctx->gate_armed = true;
+    return true;
 }
 
 void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data) {

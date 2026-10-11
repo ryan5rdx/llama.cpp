@@ -942,9 +942,45 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+// host pointer for shared (CPU-addressable) buffer memory, or null; Metal
+// reports is_host false even for shared buffers
+static void * ggml_backend_buffer_host_ptr(ggml_backend_buffer_t buffer) {
+    ggml_metal_buffer_t buf = (ggml_metal_buffer_t) buffer->context;
+    if (!ggml_metal_buffer_is_shared(buf)) {
+        return NULL;
+    }
+    return ggml_metal_buffer_get_base(buf);
+}
+
+// backend-neutral mirror of ggml_metal_gate, for ggml-rpc
+struct ggml_backend_gate_desc {
+    struct ggml_tensor * dst;
+    struct ggml_tensor * peer;
+    struct ggml_tensor * words;
+    uint32_t seq;
+    uint32_t max_iters;
+};
+
+static bool ggml_backend_set_gate_epilogue(ggml_backend_t backend, const struct ggml_backend_gate_desc * d) {
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+    struct ggml_metal_gate g;
+    g.dst       = d->dst;
+    g.peer      = d->peer;
+    g.words     = d->words;
+    g.seq       = d->seq;
+    g.max_iters = d->max_iters;
+    return ggml_metal_set_gate_epilogue(ctx, &g);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_buffer_host_ptr") == 0) {
+        return (void *)ggml_backend_buffer_host_ptr;
+    }
+    if (strcmp(name, "ggml_backend_set_gate_epilogue") == 0) {
+        return (void *)ggml_backend_set_gate_epilogue;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

@@ -26,6 +26,20 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
 void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
 
+// tensor-parallel gate, encoded at the tail of the next graph_compute's last
+// command buffer: the GPU publishes seq to words[0], spins on words[1] >= seq
+// while the host exchanges peer data, then folds dst += peer. words[2] latches
+// a timeout (the reduce is skipped); returns false if the kernel is unavailable
+struct ggml_metal_gate {
+    struct ggml_tensor * dst;
+    struct ggml_tensor * peer;
+    struct ggml_tensor * words;
+    uint32_t seq;
+    uint32_t max_iters;
+};
+
+bool ggml_metal_set_gate_epilogue(ggml_metal_t ctx, const struct ggml_metal_gate * gate);
+
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 
