@@ -37,6 +37,7 @@ set(METALLIB_KERNELS_FA_SHARED
 )
 
 set(METALLIB_KERNEL_SOURCES
+    kernels/gate.metal
     kernels/fa_aux.metal
     kernels/fa_f16.metal
     kernels/fa_f32.metal

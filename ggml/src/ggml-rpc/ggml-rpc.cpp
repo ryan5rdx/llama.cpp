@@ -83,11 +83,16 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    RPC_CMD_GRAPH_RECOMPUTE_GATED,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
+
+// all-reduces above this size keep the existing path (the fence targets
+// decode-sized payloads)
+static constexpr size_t RPC_GATE_MAX_BYTES = 1*1024*1024;
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -213,6 +218,14 @@ struct rpc_msg_get_device_memory_rsp {
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
     uint64_t uid;
+};
+
+// GRAPH_RECOMPUTE + COMM_ALLREDUCE merged, so the server can fence the reduce
+// into the graph's own command buffer
+struct rpc_msg_graph_recompute_gated_req {
+    uint32_t device;
+    uint64_t uid;
+    rpc_tensor tensor;
 };
 
 struct rpc_msg_get_tensor_2d_req {
@@ -474,6 +487,12 @@ public:
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
 
+    // Hold a GRAPH_RECOMPUTE back so the following all-reduce can merge with it.
+    void stash_recompute(std::shared_ptr<const void> input, size_t input_size);
+    bool take_recompute(std::shared_ptr<const void> & input, size_t & input_size);
+    void flush_pending(int reason = 0);
+    void release_deferred_events();
+
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
     void event_synchronize(ggml_backend_event_t event);
@@ -510,6 +529,14 @@ private:
     std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
     std::thread      thread;
+
+    std::shared_ptr<const void> pending_input;
+    size_t                      pending_size = 0;
+
+    // An event marker recorded while a recompute is stashed must not pass it:
+    // markers are held with the stash and released when it goes out.
+    std::vector<rpc_msg_ptr> deferred_events;
+    bool                     events_held_for_recompute = false;
 };
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
@@ -518,6 +545,7 @@ static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 }
 
 void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+    flush_pending();
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
@@ -530,6 +558,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
+    flush_pending();
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
@@ -540,6 +569,7 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
 }
 
 void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    flush_pending();
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
@@ -552,6 +582,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    flush_pending();
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
@@ -559,6 +590,108 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->output = output;
     msg->output_size = output_size;
     GGML_ASSERT(queue.push(msg));
+}
+
+// stash wait time and release reason (GGML_RPC_STASH_PROFILE=1 to print)
+static std::atomic<uint64_t> g_stash_n{0};
+static std::atomic<uint64_t> g_stash_us{0};
+static std::atomic<uint64_t> g_stash_max_us{0};
+static std::atomic<uint64_t> g_stash_by_reason[4];  // send, sync, meta-final, overwrite
+static thread_local double   g_stash_t0 = 0.0;
+
+static void stash_note_released(int reason) {
+    if (g_stash_t0 <= 0.0) {
+        return;
+    }
+    const uint64_t age = (uint64_t) ((double) ggml_time_us() - g_stash_t0);
+    g_stash_n.fetch_add(1, std::memory_order_relaxed);
+    g_stash_us.fetch_add(age, std::memory_order_relaxed);
+    uint64_t prev = g_stash_max_us.load(std::memory_order_relaxed);
+    while (age > prev && !g_stash_max_us.compare_exchange_weak(prev, age)) { }
+    g_stash_by_reason[reason & 3].fetch_add(1, std::memory_order_relaxed);
+    g_stash_t0 = 0.0;
+}
+
+static void stash_report() {
+    const uint64_t n = g_stash_n.load(std::memory_order_relaxed);
+    if (n == 0) {
+        fprintf(stderr, "[stash] n=0\n");
+        return;
+    }
+    fprintf(stderr, "[stash] n=%llu mean=%.1f us max=%.1f us | send=%llu sync=%llu meta-final=%llu overwrite=%llu\n",
+            (unsigned long long) n,
+            (double) g_stash_us.load(std::memory_order_relaxed) / (double) n,
+            (double) g_stash_max_us.load(std::memory_order_relaxed),
+            (unsigned long long) g_stash_by_reason[0].load(),
+            (unsigned long long) g_stash_by_reason[1].load(),
+            (unsigned long long) g_stash_by_reason[2].load(),
+            (unsigned long long) g_stash_by_reason[3].load());
+}
+
+static void stash_report_maybe() {
+    static const int every = getenv("GGML_RPC_STASH_PROFILE") != nullptr
+        ? atoi(getenv("GGML_RPC_STASH_PROFILE")) : 0;
+    if (every > 0 && g_stash_n.load(std::memory_order_relaxed) % (uint64_t) every == 0) {
+        stash_report();
+    }
+}
+
+void rpc_dispatcher::stash_recompute(std::shared_ptr<const void> input, size_t input_size) {
+    if (pending_input) {
+        // a new graph_compute supersedes the stash: send it unmerged
+        flush_pending(3);
+    }
+    pending_input = std::move(input);
+    pending_size  = input_size;
+    g_stash_t0    = (double) ggml_time_us();
+}
+
+bool rpc_dispatcher::take_recompute(std::shared_ptr<const void> & input, size_t & input_size) {
+    if (!pending_input) {
+        // no stash => no deferred marker either
+        return false;
+    }
+    input      = std::move(pending_input);
+    input_size = pending_size;
+    pending_input = nullptr;
+    pending_size  = 0;
+    // the caller sends the recompute next; markers recorded in between are held
+    // until release_deferred_events()
+    events_held_for_recompute = true;
+    return true;
+}
+
+void rpc_dispatcher::release_deferred_events() {
+    events_held_for_recompute = false;
+    for (auto & m : deferred_events) {
+        GGML_ASSERT(queue.push(m));
+    }
+    deferred_events.clear();
+}
+
+void rpc_dispatcher::flush_pending(int reason) {
+    stash_note_released(reason);
+    stash_report_maybe();
+    if (!pending_input) {
+        // releasing here would put a marker in front of a held recompute
+        if (!events_held_for_recompute) {
+            release_deferred_events();
+        }
+        return;
+    }
+    auto in = std::move(pending_input);
+    auto n  = pending_size;
+    pending_input = nullptr;
+    pending_size  = 0;
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = RPC_CMD_GRAPH_RECOMPUTE;
+    msg->input = std::move(in);
+    msg->input_size = n;
+    msg->output = nullptr;
+    msg->output_size = 0;
+    GGML_ASSERT(queue.push(msg));
+    // the recompute is on the wire; markers may follow it
+    release_deferred_events();
 }
 
 ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
@@ -579,19 +712,30 @@ void rpc_dispatcher::event_free(ggml_backend_event_t event) {
 }
 
 void rpc_dispatcher::event_synchronize(ggml_backend_event_t event) {
+    // flush first: a marker deferred behind a stash would otherwise never be sent
+    flush_pending(1);
+    release_deferred_events();
     rpc_event * ev = (rpc_event *)event->context;
     ev->sf.wait();
 }
 
 void rpc_dispatcher::event_record(ggml_backend_event_t event) {
+    // a marker must not pass a stashed recompute still waiting to merge
     rpc_event * ev = (rpc_event *)event->context;
     ev->msg = std::make_shared<rpc_msg>();
     ev->msg->cmd = RPC_CMD_NONE;
     ev->sf = ev->msg->completion.get_future().share();
+    if (pending_input || events_held_for_recompute) {
+        deferred_events.push_back(ev->msg);
+        return;
+    }
     GGML_ASSERT(queue.push(ev->msg));
 }
 
 void rpc_dispatcher::synchronize() {
+    // a stash held past the last all-reduce of a token would never merge and
+    // would block the synchronize
+    flush_pending(1);
     // to ensure all messages are processed, submit dummy message and wait for it to complete
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = RPC_CMD_NONE;
@@ -671,18 +815,20 @@ rpc_dispatcher::~rpc_dispatcher() {
 static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<rpc_dispatcher>> dispatchers;
+    // strong: a weak cache makes every context rebuild reconnect and renegotiate
+    // the RDMA queue pair
+    // heap-allocated and never freed: Apple RDMA teardown during static
+    // destruction wedges the process
+    static auto * dispatchers = new std::unordered_map<std::string, std::shared_ptr<rpc_dispatcher>>();
 
-    auto it = dispatchers.find(endpoint);
-    if (it != dispatchers.end()) {
-        if (auto dispatcher = it->second.lock()) {
-            return dispatcher;
-        }
+    auto it = dispatchers->find(endpoint);
+    if (it != dispatchers->end()) {
+        return it->second;
     }
 
     auto dispatcher = std::make_shared<rpc_dispatcher>();
     dispatcher->start(endpoint);
-    dispatchers[endpoint] = dispatcher;
+    (*dispatchers)[endpoint] = dispatcher;
     return dispatcher;
 }
 
@@ -1168,13 +1314,20 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
 void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) {
     std::lock_guard<std::mutex> lock(graph_mutex);
     GGML_ASSERT(cgraph->n_nodes > 0);
+    static const bool merge_gate = getenv("GGML_RPC_MERGE_GATE") == nullptr
+        || atoi(getenv("GGML_RPC_MERGE_GATE")) != 0;
     auto & device_graph_uids = graph_uids[device];
     bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
         request->device = device;
         request->uid    = cgraph->uid;
-        send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+        if (merge_gate) {
+            // hold it: if an all-reduce follows, the two go as one message
+            stash_recompute(std::move(request), sizeof(*request));
+        } else {
+            send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
+        }
     } else {
         if (cgraph->uid != 0) {
             if (device_graph_uids.size() >= GRAPH_CACHE_MAX) {
@@ -1302,6 +1455,143 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 // RPC server-side implementation
 
+typedef bool (*ggml_backend_set_gate_epilogue_t)(ggml_backend_t backend, const struct ggml_backend_gate_desc * d);
+struct ggml_backend_gate_desc {
+    struct ggml_tensor * dst;
+    struct ggml_tensor * peer;
+    struct ggml_tensor * words;
+    uint32_t seq;
+    uint32_t max_iters;
+};
+
+static ggml_backend_set_gate_epilogue_t rpc_set_gate(ggml_backend_t backend) {
+    if (getenv("GGML_RPC_GATE_FENCE") == nullptr || atoi(getenv("GGML_RPC_GATE_FENCE")) == 0) {
+        return nullptr;
+    }
+    static ggml_backend_set_gate_epilogue_t fn = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        fn = (ggml_backend_set_gate_epilogue_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_set_gate_epilogue");
+        GGML_LOG_INFO("rpc: in-buffer gate fence: %s\n", fn ? "on" : "unavailable on this backend");
+    }
+    return fn;
+}
+
+// host pointer for CPU-addressable buffer memory, or null (enables direct
+// gate i/o instead of staging through vectors)
+typedef void * (*ggml_backend_buffer_host_ptr_t)(ggml_backend_buffer_t buffer);
+
+static void * rpc_tensor_host_ptr(ggml_backend_t backend, const ggml_tensor * t) {
+    static const bool disabled = getenv("GGML_RPC_NO_DIRECT_IO") != nullptr;
+    if (disabled) {
+        return nullptr;
+    }
+    static ggml_backend_buffer_host_ptr_t fn = nullptr;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        fn = (ggml_backend_buffer_host_ptr_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_buffer_host_ptr");
+        GGML_LOG_INFO("rpc: direct gate i/o: %s\n", fn ? "on" : "unavailable on this backend");
+    }
+    if (fn == nullptr || t == nullptr || t->data == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+    if (buffer == nullptr || fn(buffer) == nullptr) {
+        return nullptr;
+    }
+    return t->data;
+}
+
+static int rpc_gate_depth() {
+    static int d = -1;
+    if (d < 0) {
+        const char * e = getenv("GGML_RPC_GATE_DEPTH");
+        d = e != nullptr ? atoi(e) : 0;
+        if (d < 0) { d = 0; }
+        if (d > 4) { d = 4; }
+    }
+    return d;
+}
+
+static uint32_t rpc_gate_max_iters() {
+    const char * e = getenv("GGML_RPC_GATE_MAX_ITERS");
+    // the cap only has to outlast inter-rank arrival skew, which is bounded by
+    // nothing the host controls; one timeout latches the fence off (fail-closed)
+    return e != nullptr ? (uint32_t) atoi(e) : 20000000u;
+}
+
+// both ranks send before either waits, so the transfers cross instead of paying
+// a serialised round trip; safe while the send fits the transport's pre-posted
+// receive ring / socket buffer, so larger payloads keep the serialised order
+static bool rpc_gate_exchange(const socket_ptr & peer, uint32_t rank,
+                              const void * send_from, void * recv_into, size_t nbytes,
+                              double * t_sent_us) {
+    static constexpr size_t RPC_SIMUL_MAX = 64*1024;
+
+    // GGML_RPC_GATE_SIMUL=0 restores the serialised order, for A/B in one build
+    static const bool simul = getenv("GGML_RPC_GATE_SIMUL") == nullptr
+        || atoi(getenv("GGML_RPC_GATE_SIMUL")) != 0;
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    if ((simul && nbytes <= RPC_SIMUL_MAX) || rank == 0) {
+        if (!peer->send_data(send_from, nbytes) || !peer->flush()) {
+            return false;
+        }
+        // everything above is local; only the recv waits on the peer
+        if (t_sent_us) {
+            *t_sent_us = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - t0).count();
+        }
+        return peer->recv_data(recv_into, nbytes);
+    }
+    return peer->recv_data(recv_into, nbytes) &&
+           peer->send_data(send_from, nbytes) && peer->flush();
+}
+
+// per-gate phase breakdown (GGML_RPC_GATE_PROFILE); host/gate excludes arrive
+static void rpc_gate_phase_prof(double arrive, double wire, double release, double sent) {
+    static const int every = getenv("GGML_RPC_GATE_PROFILE") != nullptr
+        ? atoi(getenv("GGML_RPC_GATE_PROFILE")) : 0;
+    if (every <= 0) {
+        return;
+    }
+    static thread_local uint64_t n = 0;
+    static thread_local double a_arrive = 0, a_wire = 0, a_release = 0, a_sent = 0;
+    n++;
+    a_arrive += arrive; a_wire += wire; a_release += release; a_sent += sent;
+    if (n % (uint64_t) every == 0) {
+        GGML_LOG_INFO("[gate_phase] gates=%llu arrive=%.1f wire=%.1f release=%.1f us | host/gate=%.1f us (local send %.1f, peer wait %.1f)\n",
+                      (unsigned long long) n, a_arrive/n, a_wire/n, a_release/n,
+                      (a_wire + a_release)/n, a_sent/n, (a_wire - a_sent)/n);
+        a_arrive = a_wire = a_release = a_sent = 0;
+        n = 0;
+    }
+}
+
+// GPU spin time inside the fence, from words[3]
+static void rpc_gate_spin_prof(uint32_t iters) {
+    static const int every = getenv("GGML_RPC_GATE_PROFILE") != nullptr
+        ? atoi(getenv("GGML_RPC_GATE_PROFILE")) : 0;
+    if (every <= 0) {
+        return;
+    }
+    static uint64_t n = 0, sum = 0, mx = 0;
+    sum += iters;
+    if (iters > mx) { mx = iters; }
+    if (++n % (uint64_t) every != 0) {
+        return;
+    }
+    const double per = (double) sum / (double) every;
+    GGML_LOG_INFO("[gate_spin] gates %llu  iters/gate %.0f (max %llu)\n",
+                  (unsigned long long) n, per, (unsigned long long) mx);
+    sum = 0; mx = 0;
+}
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
@@ -1327,6 +1617,8 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool graph_recompute_gated(const rpc_msg_graph_recompute_gated_req & request);
+    bool gate_drain_all();
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
     bool comm_free(const rpc_msg_comm_free_req & request);
@@ -1349,6 +1641,19 @@ private:
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
 
 
+    // one gate handed to the service thread
+    struct gate_job {
+        uint32_t            seq       = 0;
+        volatile uint32_t * w         = nullptr;
+        ggml_tensor       * t_dst    = nullptr;   // staging source; null on the lookahead path
+        ggml_tensor       * t_peer   = nullptr;   // staging sink; null on the lookahead path
+        size_t              nbytes    = 0;
+        void              * send_from = nullptr;   // null => stage out of t_dst
+        void              * recv_into = nullptr;   // null => stage into t_peer
+        bool                dst_direct = false;
+        std::chrono::steady_clock::time_point t_submit;
+    };
+
     // pairwise allreduce over a direct connection to the peer server
     struct comm_state {
         socket_ptr              peer;
@@ -1358,14 +1663,39 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
+
+        // per-slot fence words and peer scratch; depth+1 sets so a slot is only
+        // reused after its gate's reduce consumed the peer data
+        std::vector<ggml_backend_buffer_ptr> slot_words;
+        std::vector<ggml_backend_buffer_ptr> slot_scratch;
+        std::vector<size_t>                  slot_scratch_size;
+
+        // gate-service thread; jobs carry everything it needs pre-resolved
+        std::deque<gate_job>    jobs;
+        std::mutex              jobs_mtx;
+        std::condition_variable jobs_cv;
+        std::condition_variable done_cv;
+        std::thread             svc;
+        bool                    svc_stop   = false;
+        bool                    svc_failed = false;
+
+        uint32_t gate_seq = 0;
+        bool     gate_timed_out = false;
     };
+
+    bool gate_drain(comm_state & state);
+    bool gate_service_one(comm_state & state, gate_job & j);
+    void gate_svc_loop(comm_state & state);
+    bool graph_recompute_fenced(const rpc_msg_graph_recompute_gated_req & request, bool * taken);
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // computed graphs cached per backend, keyed by uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-    std::vector<comm_state> comm_states;
+    // deque, not vector: comm_state holds a thread and sync primitives and must
+    // not move once constructed
+    std::deque<comm_state> comm_states;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -2089,6 +2419,287 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     return true;
 }
 
+bool rpc_server::graph_recompute_fenced(const rpc_msg_graph_recompute_gated_req & request, bool * taken) {
+    *taken = false;
+    const uint32_t device = request.device;
+    comm_state & state = comm_states[device];
+    ggml_backend_t backend = backends[device];
+
+    auto set_gate = rpc_set_gate(backend);
+    if (set_gate == nullptr || state.peer == nullptr) {
+        return false;
+    }
+
+    size_t ctx_size = 8*ggml_tensor_overhead();
+    struct ggml_init_params params = { ctx_size, NULL, true };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+
+    ggml_tensor * t_dst = deserialize_tensor(ctx, &request.tensor);
+    // non-dense dst falls back: the kernel and the wire exchange assume dense
+    if (t_dst == nullptr || t_dst->buffer == nullptr || t_dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(t_dst)) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(t_dst);
+    // the fence targets decode-sized all-reduces, where removing the GPU idle
+    // dominates; large prefill payloads are wire-bound either way and keep the
+    // existing all-reduce path
+    if (nbytes == 0 || nbytes > RPC_GATE_MAX_BYTES) {
+        return false;
+    }
+
+    // depth+1 slots so a slot is only reused after its gate's reduce is done
+    const size_t nslots = (size_t) rpc_gate_depth() + 1;
+    if (state.slot_words.size() != nslots) {
+        gate_drain(state);
+        state.slot_words.resize(nslots);
+        state.slot_scratch.resize(nslots);
+        state.slot_scratch_size.assign(nslots, 0);
+    }
+    const size_t slot = (size_t) (state.gate_seq + 1) % nslots;
+
+    if (state.slot_scratch_size[slot] < nbytes) {
+        // growth reallocates a buffer a live gate may be reading
+        gate_drain(state);
+        ggml_backend_synchronize(backend);
+        state.slot_scratch[slot].reset(ggml_backend_alloc_buffer(backend, nbytes));
+        if (!state.slot_scratch[slot]) { return false; }
+        state.slot_scratch_size[slot] = nbytes;
+    }
+    if (!state.slot_words[slot]) {
+        state.slot_words[slot].reset(ggml_backend_alloc_buffer(backend, 64));
+        if (!state.slot_words[slot]) {
+            return false;
+        }
+        memset(ggml_backend_buffer_get_base(state.slot_words[slot].get()), 0, 64);
+    }
+
+    ggml_tensor * t_peer = ggml_new_tensor_4d(ctx, t_dst->type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
+    t_peer->buffer = state.slot_scratch[slot].get();
+    t_peer->data   = ggml_backend_buffer_get_base(state.slot_scratch[slot].get());
+
+    ggml_tensor * t_words = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+    t_words->buffer = state.slot_words[slot].get();
+    t_words->data   = ggml_backend_buffer_get_base(state.slot_words[slot].get());
+
+    volatile uint32_t * w = (volatile uint32_t *) t_words->data;
+    if (state.svc_failed) {
+        GGML_LOG_ERROR("[%s] a previous gate failed on the service thread; failing this one too\n", __func__);
+        *taken = true;
+        return false;
+    }
+    if (state.gate_timed_out || __atomic_load_n(&w[2], __ATOMIC_SEQ_CST) != 0) {
+        // a timeout means the GPU skipped the reduce (data loss, not fallback
+        // material): latch and fail rather than serve unreduced logits
+        if (!state.gate_timed_out) {
+            state.gate_timed_out = true;
+            GGML_LOG_ERROR("[%s] gate %u fence timed out (max_iters %u); the GPU skipped the reduce and the token is corrupt. Failing the request rather than returning wrong logits.\n",
+                           __func__, state.gate_seq, rpc_gate_max_iters());
+        }
+        *taken = true;   // do not let the caller retry this down the unfenced path
+        return false;
+    }
+    // spin count of the gate that previously used this slot
+    rpc_gate_spin_prof(__atomic_load_n(&w[3], __ATOMIC_SEQ_CST));
+
+    const uint32_t seq = ++state.gate_seq;
+    __atomic_store_n(&w[3], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&w[0], 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&w[1], 0, __ATOMIC_SEQ_CST);
+
+    struct ggml_backend_gate_desc d;
+    d.dst = t_dst; d.peer = t_peer; d.words = t_words;
+    d.seq = seq;   d.max_iters = rpc_gate_max_iters();
+    if (!set_gate(backend, &d)) {
+        return false;
+    }
+
+    rpc_msg_graph_recompute_req g;
+    g.device = device;
+    g.uid    = request.uid;
+    *taken = true; // past here a fallback would submit the same graph twice
+    if (!graph_recompute(g)) {
+        return false;
+    }
+
+    const auto t_submit = std::chrono::steady_clock::now();
+
+    // resolve exchange pointers up front; they do not depend on the graph result
+    void * src_ptr = rpc_tensor_host_ptr(backend, t_dst);
+    void * dst_ptr = rpc_tensor_host_ptr(backend, t_peer);
+    const void * send_from = src_ptr;
+    void       * recv_into = dst_ptr;
+    if (send_from == nullptr) {
+        state.send_buf.resize(nbytes);
+    }
+    if (recv_into == nullptr) {
+        state.recv_buf.resize(nbytes);
+        recv_into = state.recv_buf.data();
+    }
+
+    gate_job j;
+    j.seq       = seq;
+    j.w         = w;
+    j.t_dst     = t_dst;
+    j.t_peer    = t_peer;
+    j.nbytes    = nbytes;
+    j.send_from = src_ptr;
+    j.recv_into = recv_into;
+    j.dst_direct = dst_ptr != nullptr;
+    j.t_submit  = t_submit;
+
+    // staged gates share send_buf/recv_buf, so they must run inline
+    const bool needs_staging = src_ptr == nullptr || dst_ptr == nullptr;
+    const int  depth = rpc_gate_depth();
+
+    static bool said_depth = false;
+    if (!said_depth) {
+        said_depth = true;
+        GGML_LOG_INFO("rpc: gate depth=%d staging=%s -> %s\n", depth,
+                      needs_staging ? "yes" : "no",
+                      (depth == 0 || needs_staging) ? "inline (synchronous)" : "lookahead");
+    }
+
+    if (depth == 0 || needs_staging) {
+        if (depth != 0) { gate_drain(state); }
+        return gate_service_one(state, j);
+    }
+
+    // t_dst/t_peer die with ctx_ptr; the lookahead path never touches them
+    j.t_dst  = nullptr;
+    j.t_peer = nullptr;
+
+    if (!state.svc.joinable()) {
+        state.svc_stop = false;
+        state.svc = std::thread([this, &state]{ this->gate_svc_loop(state); });
+        GGML_LOG_INFO("rpc: gate lookahead on, depth %d (%zu slots)\n", depth, nslots);
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(state.jobs_mtx);
+        state.jobs.push_back(j);
+        state.jobs_cv.notify_one();
+        // bounded: allow `depth` gates in flight, then hold the submission thread
+        state.done_cv.wait(lk, [&]{ return state.jobs.size() <= (size_t) depth || state.svc_failed; });
+        if (state.svc_failed) { return false; }
+    }
+    return true;
+}
+
+bool rpc_server::graph_recompute_gated(const rpc_msg_graph_recompute_gated_req & request) {
+    static bool said_gated = false;
+    if (!said_gated) { said_gated = true; GGML_LOG_INFO("rpc: merged graph+gate messages in use\n"); }
+    if (request.device < comm_states.size()) {
+        bool taken = false;
+        const bool ok = graph_recompute_fenced(request, &taken);
+        if (ok || taken) {
+            return ok;
+        }
+    }
+    rpc_msg_graph_recompute_req g;
+    g.device = request.device;
+    g.uid    = request.uid;
+    if (!graph_recompute(g)) {
+        return false;
+    }
+    rpc_msg_comm_allreduce_req a;
+    a.device = request.device;
+    a.tensor = request.tensor;
+    return comm_allreduce(a);
+}
+
+bool rpc_server::gate_service_one(comm_state & state, gate_job & j) {
+    volatile uint32_t * w = j.w;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    while (__atomic_load_n(&w[0], __ATOMIC_SEQ_CST) != j.seq) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
+            GGML_LOG_ERROR("[gate_service] gate %u never arrived\n", j.seq);
+            __atomic_store_n(&w[1], j.seq, __ATOMIC_SEQ_CST);  // never leave the GPU parked
+            return false;
+        }
+    }
+    const auto t_arrive = std::chrono::steady_clock::now();
+
+    const void * send_from = j.send_from;
+    if (send_from == nullptr) {
+        GGML_ASSERT(j.t_dst != nullptr && "staged gate reached the service thread");
+        ggml_backend_tensor_get(j.t_dst, state.send_buf.data(), 0, j.nbytes);
+        send_from = state.send_buf.data();
+    }
+
+    double t_sent_us = 0.0;
+    if (!rpc_gate_exchange(state.peer, state.rank, send_from, j.recv_into, j.nbytes, &t_sent_us)) {
+        __atomic_store_n(&w[1], j.seq, __ATOMIC_SEQ_CST);
+        return false;
+    }
+    const auto t_wire = std::chrono::steady_clock::now();
+
+    if (!j.dst_direct) {
+        GGML_ASSERT(j.t_peer != nullptr && "staged gate reached the service thread");
+        ggml_backend_tensor_set(j.t_peer, state.recv_buf.data(), 0, j.nbytes);
+    }
+    __atomic_store_n(&w[1], j.seq, __ATOMIC_SEQ_CST);
+
+    {
+        using us = std::chrono::duration<double, std::micro>;
+        rpc_gate_phase_prof(us(t_arrive - j.t_submit).count(),
+                            us(t_wire   - t_arrive  ).count(),
+                            us(std::chrono::steady_clock::now() - t_wire).count(),
+                            t_sent_us);
+    }
+    return true;
+}
+
+void rpc_server::gate_svc_loop(comm_state & state) {
+    for (;;) {
+        gate_job j;
+        {
+            std::unique_lock<std::mutex> lk(state.jobs_mtx);
+            state.jobs_cv.wait(lk, [&]{ return state.svc_stop || !state.jobs.empty(); });
+            if (state.svc_stop && state.jobs.empty()) { return; }
+            j = state.jobs.front();
+        }
+
+        const bool ok = gate_service_one(state, j);
+
+        {
+            std::lock_guard<std::mutex> lk(state.jobs_mtx);
+            state.jobs.pop_front();
+            if (!ok) {
+                // latch, and release every gate still queued behind this one, or
+                // the GPU spins each of them to the cap and the worker looks hung
+                state.svc_failed = true;
+                for (auto & q : state.jobs) {
+                    __atomic_store_n(&q.w[1], q.seq, __ATOMIC_SEQ_CST);
+                }
+                state.jobs.clear();
+            }
+        }
+        state.done_cv.notify_all();
+    }
+}
+
+// Block until nothing is in flight. Anything that reads tensors, frees buffers,
+// synchronizes or tears down must call this first.
+bool rpc_server::gate_drain(comm_state & state) {
+    std::unique_lock<std::mutex> lk(state.jobs_mtx);
+    state.done_cv.wait(lk, [&]{ return state.jobs.empty(); });
+    return !state.svc_failed;
+}
+
+// false if any in-flight gate failed. The caller must not proceed: a failed gate
+// leaves this rank's partial unreduced, and the next command would read it.
+bool rpc_server::gate_drain_all() {
+    bool ok = true;
+    for (auto & st : comm_states) {
+        if (st.svc.joinable() && !gate_drain(st)) { ok = false; }
+    }
+    return ok;
+}
+
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     uint32_t device = request.device;
     if (device >= backends.size()) {
@@ -2300,7 +2911,11 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
     if (request.device >= backends.size()) {
         return false;
     }
-    comm_states[request.device] = comm_state();
+    // retire the peer link, don't destroy: COMM_FREE arrives at client exit
+    static std::vector<socket_ptr> * retired = new std::vector<socket_ptr>();
+    if (comm_states[request.device].peer != nullptr) {
+        retired->push_back(std::move(comm_states[request.device].peer));
+    }
     return true;
 }
 
@@ -2319,8 +2934,27 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    // drain first: a queued gate still has the GPU parked on it
+    for (auto & st : comm_states) {
+        if (st.svc.joinable()) {
+            gate_drain(st);
+            {
+                std::lock_guard<std::mutex> lk(st.jobs_mtx);
+                st.svc_stop = true;
+            }
+            st.jobs_cv.notify_all();
+            st.svc.join();
+        }
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
+    }
+    // retire the peer links: Apple RDMA teardown mid-process wedges the host
+    static std::vector<socket_ptr> * retired = new std::vector<socket_ptr>();
+    for (auto & state : comm_states) {
+        if (state.peer != nullptr) {
+            retired->push_back(std::move(state.peer));
+        }
     }
 }
 
@@ -2370,6 +3004,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+            break;
+        }
+        // anything but another gate must wait for in-flight gates to drain
+        if (cmd != RPC_CMD_GRAPH_RECOMPUTE_GATED && !server.gate_drain_all()) {
+            // a gate failed on the service thread; this rank's partial was never
+            // reduced, so failing the connection beats serving wrong logits
+            GGML_LOG_ERROR("a gate failed asynchronously; closing the connection\n");
             break;
         }
         switch (cmd) {
@@ -2590,6 +3231,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GRAPH_RECOMPUTE_GATED: {
+                rpc_msg_graph_recompute_gated_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.graph_recompute_gated(request)) {
                     return;
                 }
                 break;
@@ -2980,17 +3631,49 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
         }
     }
     for (size_t i = 0; i < n_ranks; i++) {
+        auto & r = comm_ctx->ranks[i];
+        std::shared_ptr<const void> held;
+        size_t held_size = 0;
+        if (r.dispatcher->take_recompute(held, held_size)) {
+            // merge recompute + all-reduce into one GATED message when possible
+            const auto * rc = held_size == sizeof(rpc_msg_graph_recompute_req)
+                ? (const rpc_msg_graph_recompute_req *) held.get() : nullptr;
+            if (rc != nullptr && rc->device == r.device) {
+                auto req = std::make_shared<rpc_msg_graph_recompute_gated_req>();
+                req->device = rc->device;
+                req->uid    = rc->uid;
+                req->tensor = serialize_tensor(tensors[i]);
+                r.dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE_GATED, req, sizeof(*req));
+                // the recompute is on the wire; markers may pass it
+                r.dispatcher->release_deferred_events();
+                continue;
+            }
+            // not ours, or not the shape we can merge - put it on the wire unmerged
+            r.dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, held, held_size);
+            r.dispatcher->release_deferred_events();
+        }
         auto request = std::make_shared<rpc_msg_comm_allreduce_req>();
-        request->device = comm_ctx->ranks[i].device;
+        request->device = r.device;
         request->tensor = serialize_tensor(tensors[i]);
-        comm_ctx->ranks[i].dispatcher->send_async(RPC_CMD_COMM_ALLREDUCE, request, sizeof(*request));
+        r.dispatcher->send_async(RPC_CMD_COMM_ALLREDUCE, request, sizeof(*request));
     }
     return true;
+}
+
+// the meta backend flushes every rank after the final subgraph: no all-reduce
+// follows, so the stash would never release
+static void ggml_backend_rpc_flush_pending(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_rpc(backend));
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_ctx->dispatcher->flush_pending(2);
 }
 
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
+    }
+    if (std::strcmp(name, "ggml_backend_flush_pending") == 0) {
+        return (void *)ggml_backend_rpc_flush_pending;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;

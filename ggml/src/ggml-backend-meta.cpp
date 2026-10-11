@@ -1836,6 +1836,10 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // drains a backend's stashed work; the last subgraph has no all-reduce to
+    // merge into, so it must be pushed out explicitly
+    void (*flush_pending)(ggml_backend_t) = nullptr;
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1867,6 +1871,9 @@ struct ggml_backend_meta_context {
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
+        flush_pending = (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])),
+            "ggml_backend_flush_pending");
     }
 
     ~ggml_backend_meta_context() {
@@ -2472,6 +2479,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
+            }
+        }
+
+        if (backend_ctx->flush_pending != nullptr && i + 1 == backend_ctx->n_subgraphs) {
+            // no all-reduce follows the final subgraph; flush every rank before
+            // the sequential synchronize, which would otherwise serialize them
+            for (size_t j = 0; j < n_backends; j++) {
+                backend_ctx->flush_pending(backend_ctx->backend_configs[j].backend);
             }
         }
 

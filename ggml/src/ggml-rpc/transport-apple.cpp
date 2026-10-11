@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <mutex>
+#include <unordered_map>
 #include <dlfcn.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -55,6 +57,52 @@ struct apple_rdma_caps {
 };
 
 static_assert(sizeof(apple_rdma_caps) == RPC_CONN_CAPS_SIZE, "apple_rdma_caps must match conn_caps size");
+
+// One ibv_context per physical device, refcounted: ibv_close_device invalidates
+// the memory regions of every other link on that device, so the context may
+// only be closed after the last link releases it
+namespace {
+struct rdma_dev_entry {
+    struct ibv_context * ctx = nullptr;
+    int                  refs = 0;
+};
+std::mutex g_rdma_dev_mutex;
+std::unordered_map<std::string, rdma_dev_entry> g_rdma_devs;
+
+struct ibv_context * rdma_dev_acquire(struct ibv_device * dev) {
+    const char * name = ibv_get_device_name(dev);
+    const std::string key = name ? name : "";
+
+    std::lock_guard<std::mutex> lock(g_rdma_dev_mutex);
+    auto & e = g_rdma_devs[key];
+    if (e.ctx == nullptr) {
+        e.ctx = ibv_open_device(dev);
+        if (e.ctx == nullptr) {
+            g_rdma_devs.erase(key);
+            return nullptr;
+        }
+    }
+    e.refs++;
+    return e.ctx;
+}
+
+void rdma_dev_release(struct ibv_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_rdma_dev_mutex);
+    for (auto it = g_rdma_devs.begin(); it != g_rdma_devs.end(); ++it) {
+        if (it->second.ctx == ctx) {
+            if (--it->second.refs <= 0) {
+                ibv_close_device(it->second.ctx);
+                g_rdma_devs.erase(it);
+            }
+            return;
+        }
+    }
+    ibv_close_device(ctx);
+}
+} // namespace
 
 struct apple_rdma::impl {
     int fd = -1;                      // bootstrap TCP socket, kept as the liveness anchor
@@ -125,7 +173,7 @@ struct apple_rdma::impl {
         free(recv_mem);
         if (cq)  ibv_destroy_cq(cq);
         if (pd)  ibv_dealloc_pd(pd);
-        if (ctx) ibv_close_device(ctx);
+        if (ctx) rdma_dev_release(ctx);
     }
 };
 
@@ -212,12 +260,12 @@ std::unique_ptr<apple_rdma> apple_rdma::probe(int fd, const uint8_t * target_gid
     int gid_idx = -1;
     std::string matched;
     for (int d = 0; d < ndev; d++) {
-        ibv_context * c = ibv_open_device(devs[d]);
+        ibv_context * c = rdma_dev_acquire(devs[d]);
         if (!c) continue;
         struct ibv_port_attr p = {};
         uint8_t pt = rdma_first_active_port(c, &p);
         int gi = pt ? rdma_match_gid(c, pt, p.gid_tbl_len, target_gid, &gid) : -1;
-        if (gi < 0) { ibv_close_device(c); continue; }
+        if (gi < 0) { rdma_dev_release(c); continue; }
         ctx = c; port = pt; pa = p; gid_idx = gi;
         const char * name = ibv_get_device_name(devs[d]);
         matched = name ? name : "";
